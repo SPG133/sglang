@@ -39,7 +39,9 @@ import copy
 import dataclasses
 import logging
 import re
+import time
 from array import array
+from collections import deque
 from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
@@ -949,6 +951,29 @@ class Req(ReqDllmMixin):
         self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
 
+        # 调度实验字段：保留 SGLang 原有 time_stats，这里单独记录论文/实验需要的时间。
+        # scheduler_enqueue_time: request 首次进入 scheduler 队列的时间。
+        # prefill/decode_execution_time: 分别累计在 prefill 和 decode 阶段真正占用 GPU 的时间。
+        # kv_transfer_time: 记录 PD 模式下 KV 传输时间，便于和纯计算时间分开分析。
+        # actual_execution_time: prefill/decode 执行时间之和。
+        # waiting_time: 总完成时间减去执行时间与 KV 传输时间后的等待时间。
+        self.scheduler_enqueue_time = time.monotonic()
+        self.scheduler_enqueue_recorded = False
+        self.prefill_execution_time = 0.0
+        self.decode_execution_time = 0.0
+        self.kv_transfer_time = 0.0
+        self.actual_execution_time = 0.0
+        self.waiting_time = 0.0
+        self.release_time = 0.0
+        self._execution_start_times = deque()
+        self._kv_transfer_start_time: Optional[float] = None
+
+        # MLFQ 状态：level 越小优先级越高，tokens_in_level 表示当前队列已消耗的量子。
+        self.mlfq_level = 0
+        self.mlfq_tokens_in_level = 0
+        self.mlfq_last_queued_time = self.scheduler_enqueue_time
+        self.mlfq_starve_time = 0.0
+
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
@@ -987,6 +1012,99 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+
+    def record_scheduler_enqueue(self, timestamp: Optional[float] = None):
+        """记录 request 首次进入 scheduler 的时间。"""
+        self.scheduler_enqueue_time = (
+            timestamp if timestamp is not None else time.monotonic()
+        )
+        self.scheduler_enqueue_recorded = True
+        self.mlfq_last_queued_time = self.scheduler_enqueue_time
+        self.mlfq_starve_time = 0.0
+
+    def record_execution_start(
+        self, is_decode: bool, timestamp: Optional[float] = None
+    ):
+        """记录一次 prefill/decode step 的 GPU 开始时间。"""
+        start_time = timestamp if timestamp is not None else time.monotonic()
+        self._execution_start_times.append((start_time, is_decode))
+
+    def record_execution_end(self, timestamp: Optional[float] = None):
+        """结束最近一次 prefill/decode step，并把耗时累加到对应阶段。"""
+        if not self._execution_start_times:
+            return
+        start_time, is_decode = self._execution_start_times.popleft()
+        end_time = timestamp if timestamp is not None else time.monotonic()
+        elapsed = max(0.0, end_time - start_time)
+        if is_decode:
+            self.decode_execution_time += elapsed
+        else:
+            self.prefill_execution_time += elapsed
+        self.actual_execution_time = (
+            self.prefill_execution_time + self.decode_execution_time
+        )
+
+    def record_kv_transfer_start(self, timestamp: Optional[float] = None):
+        """开始记录一次 KV 传输。"""
+        self._kv_transfer_start_time = (
+            timestamp if timestamp is not None else time.monotonic()
+        )
+
+    def record_kv_transfer_end(self, timestamp: Optional[float] = None):
+        """结束最近一次 KV 传输。"""
+        if self._kv_transfer_start_time is None:
+            return
+        end_time = timestamp if timestamp is not None else time.monotonic()
+        self.kv_transfer_time += max(0.0, end_time - self._kv_transfer_start_time)
+        self._kv_transfer_start_time = None
+
+    def finalize_scheduler_timing(self, timestamp: Optional[float] = None):
+        """在 request 完成/释放时收口总时间信息。"""
+        end_time = timestamp if timestamp is not None else time.monotonic()
+        self.actual_execution_time = (
+            self.prefill_execution_time + self.decode_execution_time
+        )
+        self.release_time = end_time
+        total_time = max(0.0, end_time - self.scheduler_enqueue_time)
+        self.waiting_time = max(
+            0.0, total_time - self.actual_execution_time - self.kv_transfer_time
+        )
+
+    def record_mlfq_enqueue(self, timestamp: Optional[float] = None):
+        """记录 request 重新进入某个 MLFQ 队列的时间。"""
+        now = timestamp if timestamp is not None else time.monotonic()
+        self.mlfq_last_queued_time = now
+        self.mlfq_starve_time = 0.0
+
+    def record_mlfq_dequeue(self, timestamp: Optional[float] = None):
+        """记录 request 离开 MLFQ 队列参与调度。"""
+        now = timestamp if timestamp is not None else time.monotonic()
+        self.mlfq_starve_time += max(0.0, now - self.mlfq_last_queued_time)
+
+    def record_mlfq_starvation(self, timestamp: Optional[float] = None):
+        """累计 request 在等待队列中的饥饿时间。"""
+        now = timestamp if timestamp is not None else time.monotonic()
+        self.mlfq_starve_time += max(0.0, now - self.mlfq_last_queued_time)
+        self.mlfq_last_queued_time = now
+
+    def assign_mlfq_level_for_next_iter(self, next_iter_tokens: int):
+        """按下一轮预计 token 数做 skip-join 分层。"""
+        if next_iter_tokens <= 1:
+            self.mlfq_level = 0
+        elif next_iter_tokens <= 2:
+            self.mlfq_level = 1
+        else:
+            self.mlfq_level = 2
+        self.mlfq_tokens_in_level = 0
+
+    def update_mlfq_after_schedule(self, scheduled_tokens: int):
+        """量子耗尽则降级，decode 每步通常按 1 token 记账。"""
+        mlfq_quanta = (1, 2, 4)
+        self.mlfq_tokens_in_level += max(1, scheduled_tokens)
+        quantum = mlfq_quanta[min(self.mlfq_level, len(mlfq_quanta) - 1)]
+        if self.mlfq_tokens_in_level >= quantum:
+            self.mlfq_level = min(self.mlfq_level + 1, len(mlfq_quanta) - 1)
+            self.mlfq_tokens_in_level = 0
 
     @property
     def seqlen(self) -> int:

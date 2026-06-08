@@ -4846,6 +4846,7 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "mlfq",
             ],
             help="The scheduling policy of the requests.",
         )

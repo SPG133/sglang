@@ -2168,6 +2168,10 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        if not req.scheduler_enqueue_recorded:
+            req.record_scheduler_enqueue()
+        if self._is_mlfq_enabled():
+            self._prepare_mlfq_enqueue(req, is_retracted=is_retracted)
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
@@ -2188,6 +2192,40 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _is_mlfq_enabled(self) -> bool:
+        return self.schedule_policy == "mlfq"
+
+    def _prepare_mlfq_enqueue(self, req: Req, is_retracted: bool = False):
+        # Skip-join 只用于新到达请求；retract 回来的请求保留当前队列等级，
+        # 否则每次 OOM 后都会被重置到最高队列，反馈队列就失效了。
+        if not is_retracted:
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                next_iter_tokens = 1
+            else:
+                next_iter_tokens = max(1, len(req.origin_input_ids))
+            req.assign_mlfq_level_for_next_iter(next_iter_tokens)
+        req.record_mlfq_enqueue()
+
+    def _record_batch_execution_start(self, batch: ScheduleBatch):
+        now = time.monotonic()
+        decode_reqs = set(batch.decoding_reqs or [])
+        is_decode_batch = batch.forward_mode.is_decode()
+        for req in batch.reqs:
+            # 混合 chunked prefill 中，batch.forward_mode 是 extend，但 decoding_reqs
+            # 里的请求实际执行的是 decode step。
+            req.record_execution_start(is_decode_batch or req in decode_reqs, now)
+
+    def _record_batch_execution_end(self, batch: ScheduleBatch):
+        now = time.monotonic()
+        for req in batch.reqs:
+            req.record_execution_end(now)
+
+    def _finalize_finished_request_timing(self, batch: ScheduleBatch):
+        now = time.monotonic()
+        for req in batch.reqs:
+            if req.finished():
+                req.finalize_scheduler_timing(now)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -2729,6 +2767,12 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
+        if self._is_mlfq_enabled():
+            now = time.monotonic()
+            for req in can_run_list:
+                req.record_mlfq_dequeue(now)
+                req.update_mlfq_after_schedule(req.extend_input_len)
+
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
@@ -2922,6 +2966,9 @@ class Scheduler(
 
         # Update batch tensors
         batch.prepare_for_decode()
+        if self._is_mlfq_enabled():
+            for req in batch.reqs:
+                req.update_mlfq_after_schedule(1)
         return batch
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
@@ -3003,6 +3050,7 @@ class Scheduler(
             return self._run_batch_prebuilt(batch)
 
         # Run forward
+        self._record_batch_execution_start(batch)
         if self.is_generation:
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
@@ -3136,6 +3184,7 @@ class Scheduler(
                 )
 
         self._maybe_report_active_ranks()
+        self._record_batch_execution_end(batch)
 
         return ret
 
@@ -3212,6 +3261,7 @@ class Scheduler(
         if self.enable_fpm:
             self.metrics_reporter._emit_forward_pass_metrics(batch, result)
 
+        self._finalize_finished_request_timing(batch)
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()

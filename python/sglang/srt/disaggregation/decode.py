@@ -539,6 +539,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue.append(decode_req)
         return decode_req
 
+    @staticmethod
+    def _mlfq_req_key(req: Req):
+        return (
+            getattr(req, "mlfq_level", 0),
+            getattr(req, "mlfq_last_queued_time", 0.0),
+            str(req.rid),
+        )
+
+    def _sort_decode_queues_for_mlfq(self):
+        if self.scheduler.schedule_policy != "mlfq":
+            return
+        # PD decode 端有自己的 prealloc/retracted 队列；这里按 MLFQ 优先级重排，
+        # 让 --schedule-policy mlfq 不只影响普通 waiting_queue。
+        self.queue.sort(key=lambda decode_req: self._mlfq_req_key(decode_req.req))
+        self.retracted_queue.sort(key=self._mlfq_req_key)
+
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
@@ -569,6 +585,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
+        self._sort_decode_queues_for_mlfq()
 
         # allocate memory
         resumed_reqs = []
@@ -756,6 +773,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Pop the preallocated requests from the pending queue (FIFO)."""
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check)
+        self._sort_decode_queues_for_mlfq()
 
         failed_reqs = []
         preallocated_reqs = []

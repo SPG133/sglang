@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -80,6 +81,11 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 
 
 IGNORE_EOS_RESERVE_TOKENS = 1
+
+# MLFQ 的实验参数：队列号越小优先级越高，量子越小越偏向短任务/短 decode 步。
+MLFQ_NUM_LEVELS = 3
+MLFQ_QUANTA = (1, 2, 4)
+MLFQ_STARVATION_SECONDS = 1.0
 
 
 def match_prefix_for_req(
@@ -144,6 +150,7 @@ class CacheAgnosticPolicy(Enum):
     LOF = "lof"  # longest output first
     RANDOM = "random"
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
+    MLFQ = "mlfq"  # multi-level feedback queue
 
 
 class SchedulePolicy:
@@ -217,6 +224,11 @@ class SchedulePolicy:
             elif policy == CacheAgnosticPolicy.ROUTING_KEY:
                 if running_batch is not None:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
+            elif policy == CacheAgnosticPolicy.MLFQ:
+                # MLFQ 只重排等待队列；运行中的 decode batch 不在这里直接打乱，
+                # 避免破坏已有 batch 张量顺序。
+                SchedulePolicy._promote_starved_mlfq_requests(waiting_queue)
+                SchedulePolicy._sort_by_mlfq(waiting_queue)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
@@ -393,6 +405,32 @@ class SchedulePolicy:
         if _ROUTING_KEY_POLICY_DEBUG_LOG:
             waiting_keys_after = [r.routing_key for r in waiting_queue]
             logger.info(f"waiting_keys_after={waiting_keys_after}")
+
+    @staticmethod
+    def _promote_starved_mlfq_requests(waiting_queue: List[Req]) -> None:
+        now = time.monotonic()
+        for req in waiting_queue:
+            if not hasattr(req, "record_mlfq_starvation"):
+                continue
+            req.record_mlfq_starvation(now)
+            if req.mlfq_starve_time >= MLFQ_STARVATION_SECONDS:
+                # 饥饿提升：等待超过阈值的请求回到最高优先级队列。
+                req.mlfq_level = 0
+                req.mlfq_tokens_in_level = 0
+                req.mlfq_starve_time = 0.0
+                req.mlfq_last_queued_time = now
+
+    @staticmethod
+    def _sort_by_mlfq(waiting_queue: List[Req]) -> None:
+        """按 MLFQ 层级排序，同层内部保持 FIFO。"""
+        waiting_queue.sort(
+            key=lambda r: (
+                getattr(r, "mlfq_level", MLFQ_NUM_LEVELS - 1),
+                getattr(r, "mlfq_last_queued_time", 0.0),
+                r.time_stats.wait_queue_entry_time,
+                str(r.rid),
+            )
+        )
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:
