@@ -556,28 +556,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             created=created,
             choices=choices,
             usage=usage,
-            metadata={
-                "weight_version": ret[0]["meta_info"]["weight_version"],
-                "scheduler_enqueue_time": ret[0]["meta_info"].get(
-                    "scheduler_enqueue_time"
-                ),
-                "release_time": ret[0]["meta_info"].get("release_time"),
-                "prefill_execution_time": ret[0]["meta_info"].get(
-                    "prefill_execution_time"
-                ),
-                "decode_execution_time": ret[0]["meta_info"].get(
-                    "decode_execution_time"
-                ),
-                "actual_execution_time": ret[0]["meta_info"].get(
-                    "actual_execution_time"
-                ),
-                "waiting_time": ret[0]["meta_info"].get("waiting_time"),
-                "kv_transfer_time": ret[0]["meta_info"].get("kv_transfer_time"),
-                "mlfq_level": ret[0]["meta_info"].get("mlfq_level"),
-                "mlfq_tokens_in_level": ret[0]["meta_info"].get(
-                    "mlfq_tokens_in_level"
-                ),
-            },
+            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
             sglext=response_sglext,
         )
 

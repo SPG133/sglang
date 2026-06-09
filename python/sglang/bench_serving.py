@@ -1727,6 +1727,9 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+    }
+
+    timing_details = {
         "request_scheduler_enqueue_times": [
             output.scheduler_enqueue_time for output in outputs
         ],
@@ -1749,6 +1752,13 @@ async def benchmark(
             output.mlfq_tokens_in_level for output in outputs
         ],
     }
+    # 只有当这些 request 画像字段里至少有一个非空值时，才写入结果文件。
+    if any(
+        value is not None
+        for values in timing_details.values()
+        for value in values
+    ):
+        result_details.update(timing_details)
 
     # Append results to a JSONL file
     with open(output_file_name, "a") as file:
