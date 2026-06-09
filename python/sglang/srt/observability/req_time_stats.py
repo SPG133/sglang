@@ -578,6 +578,17 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # Number of prefill retries for this request
     prefill_retry_count: int = 0
 
+    # 调度实验字段：用于把 request 级执行画像统一透传到输出层。
+    scheduler_enqueue_time: float = 0.0
+    release_time: float = 0.0
+    prefill_execution_time: float = 0.0
+    decode_execution_time: float = 0.0
+    actual_execution_time: float = 0.0
+    waiting_time: float = 0.0
+    kv_transfer_time: float = 0.0
+    mlfq_level: int = 0
+    mlfq_tokens_in_level: int = 0
+
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
         if not self.enable_metrics:
@@ -1118,6 +1129,15 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         meta_data.update(
             {
                 "queue_time": self.get_queueing_time(),
+                "scheduler_enqueue_time": self.scheduler_enqueue_time,
+                "release_time": self.release_time,
+                "prefill_execution_time": self.prefill_execution_time,
+                "decode_execution_time": self.decode_execution_time,
+                "actual_execution_time": self.actual_execution_time,
+                "waiting_time": self.waiting_time,
+                "kv_transfer_time": self.kv_transfer_time,
+                "mlfq_level": self.mlfq_level,
+                "mlfq_tokens_in_level": self.mlfq_tokens_in_level,
             }
         )
         return meta_data

@@ -1070,6 +1070,18 @@ class Req(ReqDllmMixin):
             0.0, total_time - self.actual_execution_time - self.kv_transfer_time
         )
 
+        # 同步到通用的 time_stats，后续 tokenizer_manager / OpenAI 接口 /
+        # benchmark 都统一从 time_stats 输出，避免只在某些模式下能拿到。
+        self.time_stats.scheduler_enqueue_time = self.scheduler_enqueue_time
+        self.time_stats.release_time = self.release_time
+        self.time_stats.prefill_execution_time = self.prefill_execution_time
+        self.time_stats.decode_execution_time = self.decode_execution_time
+        self.time_stats.actual_execution_time = self.actual_execution_time
+        self.time_stats.waiting_time = self.waiting_time
+        self.time_stats.kv_transfer_time = self.kv_transfer_time
+        self.time_stats.mlfq_level = self.mlfq_level
+        self.time_stats.mlfq_tokens_in_level = self.mlfq_tokens_in_level
+
     def record_mlfq_enqueue(self, timestamp: Optional[float] = None):
         """记录 request 重新进入某个 MLFQ 队列的时间。"""
         now = timestamp if timestamp is not None else time.monotonic()
