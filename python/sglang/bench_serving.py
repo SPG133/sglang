@@ -145,21 +145,21 @@ def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
     return (message.get("reasoning_content") or "") + (message.get("content") or "")
 
 
-def _populate_request_timing_from_metadata(
-    output: "RequestFuncOutput", metadata: Optional[Dict[str, Any]]
+def _populate_request_timing_from_meta_info(
+    output: "RequestFuncOutput", meta_info: Optional[Dict[str, Any]]
 ) -> None:
-    """把服务端 response.metadata 里的 request 画像字段抄到 benchmark 输出对象里。"""
-    if not metadata:
+    """把服务端 response.meta_info 里的 request 画像字段抄到 benchmark 输出对象里。"""
+    if not meta_info:
         return
-    output.scheduler_enqueue_time = metadata.get("scheduler_enqueue_time")
-    output.release_time = metadata.get("release_time")
-    output.prefill_execution_time = metadata.get("prefill_execution_time")
-    output.decode_execution_time = metadata.get("decode_execution_time")
-    output.actual_execution_time = metadata.get("actual_execution_time")
-    output.waiting_time = metadata.get("waiting_time")
-    output.kv_transfer_time = metadata.get("kv_transfer_time")
-    output.mlfq_level = metadata.get("mlfq_level")
-    output.mlfq_tokens_in_level = metadata.get("mlfq_tokens_in_level")
+    output.scheduler_enqueue_time = meta_info.get("scheduler_enqueue_time")
+    output.release_time = meta_info.get("release_time")
+    output.prefill_execution_time = meta_info.get("prefill_execution_time")
+    output.decode_execution_time = meta_info.get("decode_execution_time")
+    output.actual_execution_time = meta_info.get("actual_execution_time")
+    output.waiting_time = meta_info.get("waiting_time")
+    output.kv_transfer_time = meta_info.get("kv_transfer_time")
+    output.mlfq_level = meta_info.get("mlfq_level")
+    output.mlfq_tokens_in_level = meta_info.get("mlfq_tokens_in_level")
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
@@ -446,6 +446,11 @@ async def async_request_openai_chat_completions(
         # These will override defaults if present
         payload.update(request_func_input.extra_request_body)
 
+        # benchmark 需要从服务端取回每个 request 的调度画像信息。
+        # 非流式 chat 路径支持 return_meta_info=true，直接借这条通道。
+        if args.disable_stream:
+            payload["return_meta_info"] = True
+
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
             payload["model"] = request_func_input.lora_name
@@ -473,9 +478,11 @@ async def async_request_openai_chat_completions(
                         response_json = await response.json()
                         message = response_json["choices"][0]["message"]
                         output.generated_text = _combine_openai_chat_content(message)
-                        _populate_request_timing_from_metadata(
-                            output, response_json.get("metadata")
-                        )
+                        choices = response_json.get("choices") or []
+                        if choices:
+                            _populate_request_timing_from_meta_info(
+                                output, choices[0].get("meta_info")
+                            )
                         output.success = True
                         output.latency = time.perf_counter() - st
                         output.ttft = (
