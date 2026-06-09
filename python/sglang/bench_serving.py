@@ -1757,7 +1757,7 @@ async def benchmark(
         else:
             result_for_dump = result
         # 调试阶段更关心人工可读性，这里改成带缩进的 JSON，并在记录之间空一行。
-        file.write(json.dumps(result_for_dump, ensure_ascii=False, indent=2) + "\n\n")
+        file.write(json.dumps(result_for_dump, ensure_ascii=False, indent=2) + "\n")
 
     return result | result_details
 
