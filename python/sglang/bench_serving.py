@@ -106,6 +106,15 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    scheduler_enqueue_time: Optional[float] = None
+    release_time: Optional[float] = None
+    prefill_execution_time: Optional[float] = None
+    decode_execution_time: Optional[float] = None
+    actual_execution_time: Optional[float] = None
+    waiting_time: Optional[float] = None
+    kv_transfer_time: Optional[float] = None
+    mlfq_level: Optional[int] = None
+    mlfq_tokens_in_level: Optional[int] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -134,6 +143,23 @@ def get_request_headers() -> Dict[str, str]:
 
 def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
     return (message.get("reasoning_content") or "") + (message.get("content") or "")
+
+
+def _populate_request_timing_from_metadata(
+    output: "RequestFuncOutput", metadata: Optional[Dict[str, Any]]
+) -> None:
+    """把服务端 response.metadata 里的 request 画像字段抄到 benchmark 输出对象里。"""
+    if not metadata:
+        return
+    output.scheduler_enqueue_time = metadata.get("scheduler_enqueue_time")
+    output.release_time = metadata.get("release_time")
+    output.prefill_execution_time = metadata.get("prefill_execution_time")
+    output.decode_execution_time = metadata.get("decode_execution_time")
+    output.actual_execution_time = metadata.get("actual_execution_time")
+    output.waiting_time = metadata.get("waiting_time")
+    output.kv_transfer_time = metadata.get("kv_transfer_time")
+    output.mlfq_level = metadata.get("mlfq_level")
+    output.mlfq_tokens_in_level = metadata.get("mlfq_tokens_in_level")
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
@@ -447,6 +473,9 @@ async def async_request_openai_chat_completions(
                         response_json = await response.json()
                         message = response_json["choices"][0]["message"]
                         output.generated_text = _combine_openai_chat_content(message)
+                        _populate_request_timing_from_metadata(
+                            output, response_json.get("metadata")
+                        )
                         output.success = True
                         output.latency = time.perf_counter() - st
                         output.ttft = (
@@ -1597,6 +1626,21 @@ async def benchmark(
         and metrics.mean_itl_ms is not None
         and metrics.output_throughput is not None
     ):
+        actual_exec_times = [
+            output.actual_execution_time
+            for output in outputs
+            if output.success and output.actual_execution_time is not None
+        ]
+        waiting_times = [
+            output.waiting_time
+            for output in outputs
+            if output.success and output.waiting_time is not None
+        ]
+        decode_exec_times = [
+            output.decode_execution_time
+            for output in outputs
+            if output.success and output.decode_execution_time is not None
+        ]
         result = {
             # Arguments
             "tag": getattr(args, "tag", None),
@@ -1644,6 +1688,15 @@ async def benchmark(
             "accept_length": accept_length,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
+            "avg_request_actual_execution_time_ms": (
+                float(np.mean(actual_exec_times) * 1000) if actual_exec_times else None
+            ),
+            "avg_request_waiting_time_ms": (
+                float(np.mean(waiting_times) * 1000) if waiting_times else None
+            ),
+            "avg_request_decode_execution_time_ms": (
+                float(np.mean(decode_exec_times) * 1000) if decode_exec_times else None
+            ),
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -1674,6 +1727,27 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "request_scheduler_enqueue_times": [
+            output.scheduler_enqueue_time for output in outputs
+        ],
+        "request_release_times": [output.release_time for output in outputs],
+        "request_prefill_execution_times": [
+            output.prefill_execution_time for output in outputs
+        ],
+        "request_decode_execution_times": [
+            output.decode_execution_time for output in outputs
+        ],
+        "request_actual_execution_times": [
+            output.actual_execution_time for output in outputs
+        ],
+        "request_waiting_times": [output.waiting_time for output in outputs],
+        "request_kv_transfer_times": [
+            output.kv_transfer_time for output in outputs
+        ],
+        "request_mlfq_levels": [output.mlfq_level for output in outputs],
+        "request_mlfq_tokens_in_level": [
+            output.mlfq_tokens_in_level for output in outputs
+        ],
     }
 
     # Append results to a JSONL file

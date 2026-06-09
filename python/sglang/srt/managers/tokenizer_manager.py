@@ -1833,6 +1833,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
+            # 调度实验字段：把 request 级执行画像挂到 meta_info 上，供
+            # OpenAI 接口和 benchmark 脚本继续透传/导出。
+            req_obj = getattr(state, "obj", None)
+            if req_obj is not None:
+                meta_info.update(
+                    {
+                        "scheduler_enqueue_time": getattr(
+                            req_obj, "scheduler_enqueue_time", None
+                        ),
+                        "release_time": getattr(req_obj, "release_time", None),
+                        "prefill_execution_time": getattr(
+                            req_obj, "prefill_execution_time", None
+                        ),
+                        "decode_execution_time": getattr(
+                            req_obj, "decode_execution_time", None
+                        ),
+                        "actual_execution_time": getattr(
+                            req_obj, "actual_execution_time", None
+                        ),
+                        "waiting_time": getattr(req_obj, "waiting_time", None),
+                        "kv_transfer_time": getattr(
+                            req_obj, "kv_transfer_time", None
+                        ),
+                        "mlfq_level": getattr(req_obj, "mlfq_level", None),
+                        "mlfq_tokens_in_level": getattr(
+                            req_obj, "mlfq_tokens_in_level", None
+                        ),
+                    }
+                )
+
             # Surface scheduler load info on each response so clients can do
             # response-based flow control without polling /v1/loads. The
             # scheduler already piggy-backs the per-DP-rank load on
