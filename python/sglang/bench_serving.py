@@ -1230,9 +1230,16 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    def _get_request_prompt(req):
+        # Mooncake loader 返回的是原始 trace dict，普通数据集返回的是 DatasetRow。
+        # 这里统一抽象一下，避免在 warmup 前就因为访问 `.prompt` 报错。
+        if hasattr(req, "prompt"):
+            return req.prompt
+        return None
+
     # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
     # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
-    first_prompt = input_requests[0].prompt
+    first_prompt = _get_request_prompt(input_requests[0]) if input_requests else None
     is_multi_turn = (
         isinstance(first_prompt, list)
         and bool(first_prompt)
@@ -1463,8 +1470,13 @@ async def benchmark(
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
+    # Mooncake 原始 trace 在这里仍然是 dict 列表，不能像 DatasetRow 那样直接取
+    # prompt_len / output_len，因此在统计阶段显式跳过 input_requests 侧的聚合。
+    metrics_input_requests = (
+        None if is_multi_turn or args.dataset_name == "mooncake" else input_requests
+    )
     metrics, output_lens = calculate_metrics(
-        input_requests=None if is_multi_turn else input_requests,
+        input_requests=metrics_input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
