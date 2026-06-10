@@ -15,6 +15,7 @@
 
 import dataclasses
 import faulthandler
+import json
 import logging
 import os
 import signal
@@ -2221,11 +2222,41 @@ class Scheduler(
         for req in batch.reqs:
             req.record_execution_end(now)
 
+    def _dump_request_timing_record(self, req: Req):
+        """把 request 级执行画像额外落到独立文件，便于 benchmark 后单独分析。"""
+        dump_path = os.environ.get(
+            "SGLANG_REQUEST_TIMING_DUMP_FILE",
+            "/tmp/sglang_request_timing_dump.jsonl",
+        )
+        record = {
+            "rid": req.rid,
+            "scheduler_enqueue_time": req.scheduler_enqueue_time,
+            "release_time": req.release_time,
+            "prefill_execution_time": req.prefill_execution_time,
+            "decode_execution_time": req.decode_execution_time,
+            "actual_execution_time": req.actual_execution_time,
+            "waiting_time": req.waiting_time,
+            "kv_transfer_time": req.kv_transfer_time,
+            "mlfq_level": req.mlfq_level,
+            "mlfq_tokens_in_level": req.mlfq_tokens_in_level,
+            "prompt_len": len(req.origin_input_ids),
+            "output_len": len(req.output_ids),
+            "finished_reason": (
+                req.finished_reason.to_json() if req.finished_reason else None
+            ),
+        }
+        try:
+            with open(dump_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.exception("Failed to dump request timing record for rid=%s", req.rid)
+
     def _finalize_finished_request_timing(self, batch: ScheduleBatch):
         now = time.monotonic()
         for req in batch.reqs:
             if req.finished():
                 req.finalize_scheduler_timing(now)
+                self._dump_request_timing_record(req)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
