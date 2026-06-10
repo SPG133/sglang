@@ -135,52 +135,6 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
-
-def _dump_request_timing_to_file(meta_info: Dict[str, Any]) -> None:
-    """把 request 执行画像单独落到 JSONL 文件。
-
-    这是一个完全独立于 benchmark 正式输出的调试/实验文件。
-    只要 request 最终 finished 并走到 tokenizer 输出路径，就会落一条。
-    """
-    dump_path = os.environ.get(
-        "SGLANG_REQUEST_TIMING_DUMP_FILE",
-        os.path.expanduser("~/sglang/request_timing_dumps/request_timing.jsonl"),
-    )
-    os.makedirs(os.path.dirname(dump_path), exist_ok=True)
-
-    def _format_wallclock_from_monotonic(value: Any) -> Optional[str]:
-        if not isinstance(value, (int, float)) or value <= 0:
-            return None
-        # scheduler_enqueue_time / release_time 记录的是 monotonic 时间，
-        # 这里转成人类可读的本地墙钟时间，便于调试与周报记录。
-        realtime_value = convert_time_to_realtime(float(value))
-        return datetime.fromtimestamp(realtime_value).strftime("%Y-%m-%d %H:%M:%S.%f")
-
-    record = {
-        "rid": meta_info.get("id"),
-        "scheduler_enqueue_time": meta_info.get("scheduler_enqueue_time"),
-        "scheduler_enqueue_wallclock": _format_wallclock_from_monotonic(
-            meta_info.get("scheduler_enqueue_time")
-        ),
-        "release_time": meta_info.get("release_time"),
-        "release_wallclock": _format_wallclock_from_monotonic(
-            meta_info.get("release_time")
-        ),
-        "prefill_execution_time": meta_info.get("prefill_execution_time"),
-        "decode_execution_time": meta_info.get("decode_execution_time"),
-        "actual_execution_time": meta_info.get("actual_execution_time"),
-        "waiting_time": meta_info.get("waiting_time"),
-        "kv_transfer_time": meta_info.get("kv_transfer_time"),
-        "mlfq_level": meta_info.get("mlfq_level"),
-        "mlfq_tokens_in_level": meta_info.get("mlfq_tokens_in_level"),
-        "prompt_tokens": meta_info.get("prompt_tokens"),
-        "completion_tokens": meta_info.get("completion_tokens"),
-        "finish_reason": meta_info.get("finish_reason"),
-        "num_retractions": meta_info.get("num_retractions"),
-    }
-    with open(dump_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
     "output_top_logprobs",
@@ -2073,23 +2027,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
-                scheduler_time_stats = (
-                    recv_obj.time_stats[i] if recv_obj.time_stats is not None else None
-                )
-                completion_tokens = (
-                    recv_obj.completion_tokens[i]
-                    if not isinstance(recv_obj, BatchEmbeddingOutput)
-                    else 0
-                )
-                meta_info.update(
-                    state.time_stats.convert_to_output_meta_info(
-                        scheduler_time_stats, completion_tokens
+                if self.enable_metrics:
+                    scheduler_time_stats = (
+                        recv_obj.time_stats[i]
+                        if recv_obj.time_stats is not None
+                        else None
                     )
-                )
-
-                # 额外输出一份独立的 request 执行画像文件，不依赖 benchmark
-                # 正式输出结构，便于实验后单独分析。
-                _dump_request_timing_to_file(meta_info)
+                    completion_tokens = (
+                        recv_obj.completion_tokens[i]
+                        if not isinstance(recv_obj, BatchEmbeddingOutput)
+                        else 0
+                    )
+                    meta_info.update(
+                        state.time_stats.convert_to_output_meta_info(
+                            scheduler_time_stats, completion_tokens
+                        )
+                    )
 
                 del self.rid_to_state[rid]
 
