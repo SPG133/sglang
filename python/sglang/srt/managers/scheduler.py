@@ -2224,6 +2224,8 @@ class Scheduler(
 
     def _dump_request_timing_record(self, req: Req):
         """把 request 级执行画像额外落到独立文件，便于 benchmark 后单独分析。"""
+        if req.timing_dumped:
+            return
         dump_path = os.environ.get(
             "SGLANG_REQUEST_TIMING_DUMP_FILE",
             os.path.expanduser("~/sglang/request_timing.jsonl"),
@@ -2248,6 +2250,7 @@ class Scheduler(
         try:
             with open(dump_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            req.timing_dumped = True
         except Exception:
             logger.exception("Failed to dump request timing record for rid=%s", req.rid)
 

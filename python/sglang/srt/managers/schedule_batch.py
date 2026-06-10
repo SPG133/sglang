@@ -965,6 +965,7 @@ class Req(ReqDllmMixin):
         self.actual_execution_time = 0.0
         self.waiting_time = 0.0
         self.release_time = 0.0
+        self.timing_dumped = False
         self._execution_start_times = deque()
         self._kv_transfer_start_time: Optional[float] = None
 
