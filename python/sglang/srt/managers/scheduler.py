@@ -2226,7 +2226,7 @@ class Scheduler(
         """把 request 级执行画像额外落到独立文件，便于 benchmark 后单独分析。"""
         dump_path = os.environ.get(
             "SGLANG_REQUEST_TIMING_DUMP_FILE",
-            os.path.expanduser("~/sglang/data/request_timing.jsonl"),
+            os.path.expanduser("~/sglang/request_timing.jsonl"),
         )
         record = {
             "rid": req.rid,
