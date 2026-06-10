@@ -135,6 +135,36 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+
+def _dump_request_timing_to_file(meta_info: Dict[str, Any]) -> None:
+    """把 request 执行画像单独落到 JSONL 文件。
+
+    这是一个完全独立于 benchmark 正式输出的调试/实验文件。
+    只要 request 最终 finished 并走到 tokenizer 输出路径，就会落一条。
+    """
+    dump_path = os.environ.get(
+        "SGLANG_REQUEST_TIMING_DUMP_FILE",
+        "/tmp/sglang_request_timing_dump.jsonl",
+    )
+    record = {
+        "rid": meta_info.get("id"),
+        "scheduler_enqueue_time": meta_info.get("scheduler_enqueue_time"),
+        "release_time": meta_info.get("release_time"),
+        "prefill_execution_time": meta_info.get("prefill_execution_time"),
+        "decode_execution_time": meta_info.get("decode_execution_time"),
+        "actual_execution_time": meta_info.get("actual_execution_time"),
+        "waiting_time": meta_info.get("waiting_time"),
+        "kv_transfer_time": meta_info.get("kv_transfer_time"),
+        "mlfq_level": meta_info.get("mlfq_level"),
+        "mlfq_tokens_in_level": meta_info.get("mlfq_tokens_in_level"),
+        "prompt_tokens": meta_info.get("prompt_tokens"),
+        "completion_tokens": meta_info.get("completion_tokens"),
+        "finish_reason": meta_info.get("finish_reason"),
+        "num_retractions": meta_info.get("num_retractions"),
+    }
+    with open(dump_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
     "output_top_logprobs",
@@ -2038,11 +2068,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         if not isinstance(recv_obj, BatchEmbeddingOutput)
                         else 0
                     )
-                    meta_info.update(
-                        state.time_stats.convert_to_output_meta_info(
-                            scheduler_time_stats, completion_tokens
-                        )
+                meta_info.update(
+                    state.time_stats.convert_to_output_meta_info(
+                        scheduler_time_stats, completion_tokens
                     )
+                )
+
+                # 额外输出一份独立的 request 执行画像文件，不依赖 benchmark
+                # 正式输出结构，便于实验后单独分析。
+                _dump_request_timing_to_file(meta_info)
 
                 del self.rid_to_state[rid]
 
