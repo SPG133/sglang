@@ -590,10 +590,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     mlfq_tokens_in_level: int = 0
 
     def __getstate__(self) -> object:
-        # send to detokenizer/tokenizer
-        if not self.enable_metrics:
-            return {}
-
+        # 这些字段需要跨进程传给 tokenizer/detokenizer，不能再被
+        # enable_metrics 这个 Prometheus/metrics 开关整体短路掉。
+        # 否则 request 画像字段虽然在 scheduler 里算出来了，但发到输出层时
+        # 会全部回退成默认值 0。
         state = {
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
@@ -610,6 +610,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "kv_transfer_time": self.kv_transfer_time,
             "mlfq_level": self.mlfq_level,
             "mlfq_tokens_in_level": self.mlfq_tokens_in_level,
+            "enable_metrics": False,
+            "disagg_mode": self.disagg_mode,
+            "trace_ctx": self.trace_ctx,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
