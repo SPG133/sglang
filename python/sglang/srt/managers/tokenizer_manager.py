@@ -2079,22 +2079,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
-                if self.enable_metrics:
-                    scheduler_time_stats = (
-                        recv_obj.time_stats[i]
-                        if recv_obj.time_stats is not None
-                        else None
+                scheduler_time_stats = (
+                    recv_obj.time_stats[i] if recv_obj.time_stats is not None else None
+                )
+                completion_tokens = (
+                    recv_obj.completion_tokens[i]
+                    if not isinstance(recv_obj, BatchEmbeddingOutput)
+                    else 0
+                )
+                # request 画像字段不能依赖 enable_metrics，否则默认 benchmark
+                # 路径下这些值会一直丢失。这里无论 metrics 开关是否开启，
+                # finished 请求都统一合并一遍输出。
+                meta_info.update(
+                    state.time_stats.convert_to_output_meta_info(
+                        scheduler_time_stats, completion_tokens
                     )
-                    completion_tokens = (
-                        recv_obj.completion_tokens[i]
-                        if not isinstance(recv_obj, BatchEmbeddingOutput)
-                        else 0
-                    )
-                    meta_info.update(
-                        state.time_stats.convert_to_output_meta_info(
-                            scheduler_time_stats, completion_tokens
-                        )
-                    )
+                )
 
                 del self.rid_to_state[rid]
 
