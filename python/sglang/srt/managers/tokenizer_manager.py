@@ -144,12 +144,28 @@ def _dump_request_timing_to_file(meta_info: Dict[str, Any]) -> None:
     """
     dump_path = os.environ.get(
         "SGLANG_REQUEST_TIMING_DUMP_FILE",
-        "/tmp/sglang_request_timing_dump.jsonl",
+        os.path.expanduser("~/sglang/request_timing_dumps/request_timing.jsonl"),
     )
+    os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+
+    def _format_wallclock_from_monotonic(value: Any) -> Optional[str]:
+        if not isinstance(value, (int, float)) or value <= 0:
+            return None
+        # scheduler_enqueue_time / release_time 记录的是 monotonic 时间，
+        # 这里转成人类可读的本地墙钟时间，便于调试与周报记录。
+        realtime_value = convert_time_to_realtime(float(value))
+        return datetime.fromtimestamp(realtime_value).strftime("%Y-%m-%d %H:%M:%S.%f")
+
     record = {
         "rid": meta_info.get("id"),
         "scheduler_enqueue_time": meta_info.get("scheduler_enqueue_time"),
+        "scheduler_enqueue_wallclock": _format_wallclock_from_monotonic(
+            meta_info.get("scheduler_enqueue_time")
+        ),
         "release_time": meta_info.get("release_time"),
+        "release_wallclock": _format_wallclock_from_monotonic(
+            meta_info.get("release_time")
+        ),
         "prefill_execution_time": meta_info.get("prefill_execution_time"),
         "decode_execution_time": meta_info.get("decode_execution_time"),
         "actual_execution_time": meta_info.get("actual_execution_time"),
