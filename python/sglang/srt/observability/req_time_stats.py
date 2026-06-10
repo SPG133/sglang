@@ -50,6 +50,46 @@ logger = logging.getLogger(__name__)
 # Reduce system time calls by computing time.time() based on calibrated perf_counter() values.
 global_diff_realtime_monotonic = time.time() - time.perf_counter()
 
+# 这些字段是“绝对时间戳”（来自 time.perf_counter），跨线程/跨进程反序列化时
+# 需要根据 diff_realtime_monotonic 重新对齐。像 waiting_time、
+# actual_execution_time 这类“持续时间”不能做这个转换，否则 0 会被加成一个很小
+# 的浮点残差，最后在 benchmark 结果里看起来像统一的 2.38e-07。
+ABSOLUTE_TIME_FIELDS = {
+    "created_time",
+    "finished_time",
+    "first_token_time",
+    "last_time",
+    "tokenize_finish_time",
+    "api_server_dispatch_time",
+    "api_server_dispatch_finish_time",
+    "response_sent_to_client_time",
+    "dpc_dispatch_time",
+    "dpc_dispatch_finish_time",
+    "wait_queue_entry_time",
+    "forward_entry_time",
+    "prefill_finished_time",
+    "completion_time",
+    "prefill_bootstrap_queue_entry_time",
+    "prefill_transfer_queue_entry_time",
+    "prefill_kv_transfer_finish_time",
+    "decode_prealloc_queue_entry_time",
+    "decode_transfer_queue_entry_time",
+    "decode_prebuilt_finish_time",
+    "bootstrap_done_time",
+    "scheduler_recv_time",
+    "last_chunked_prefill_finish_time",
+    "last_decode_finish_time",
+    "last_decode_scheduled_time",
+    "last_forward_entry_time",
+    "last_prefill_finished_time",
+    "run_batch_cpu_start_time",
+    "spec_draft_start_time",
+    "spec_verify_start_time",
+    "spec_draft_extend_start_time",
+    "scheduler_enqueue_time",
+    "release_time",
+}
+
 
 def calibrate_time_diff():
     # due to NTP, the diff between time.time() and time.perf_counter() can change
@@ -315,7 +355,7 @@ class ReqTimeStatsBase:
 
     def __setstate__(self, state: object):
         for key in state.keys():
-            if key.endswith("time"):
+            if key in ABSOLUTE_TIME_FIELDS and state[key] > 0.0:
                 state[key] = convert_time_cross_thread(
                     state[key],
                     state["diff_realtime_monotonic"],
