@@ -711,6 +711,10 @@ async def async_request_sglang_generate(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
+                            if "meta_info" in data:
+                                _populate_request_timing_from_meta_info(
+                                    output, data.get("meta_info")
+                                )
                             if "text" in data and data["text"]:
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
