@@ -598,6 +598,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
+            # 调度实验字段：显式加入跨进程传输白名单，否则这些值会在
+            # scheduler -> tokenizer/detokenizer 的序列化过程中丢失，
+            # benchmark 最终只能看到 0。
+            "scheduler_enqueue_time": self.scheduler_enqueue_time,
+            "release_time": self.release_time,
+            "prefill_execution_time": self.prefill_execution_time,
+            "decode_execution_time": self.decode_execution_time,
+            "actual_execution_time": self.actual_execution_time,
+            "waiting_time": self.waiting_time,
+            "kv_transfer_time": self.kv_transfer_time,
+            "mlfq_level": self.mlfq_level,
+            "mlfq_tokens_in_level": self.mlfq_tokens_in_level,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state

@@ -1944,6 +1944,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
+            if get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS"):
+                logger.info(
+                    "REQ_META rid=%s enqueue=%s release=%s prefill_exec=%s decode_exec=%s actual_exec=%s waiting=%s kv_transfer=%s mlfq_level=%s mlfq_tokens=%s",
+                    rid,
+                    meta_info.get("scheduler_enqueue_time"),
+                    meta_info.get("release_time"),
+                    meta_info.get("prefill_execution_time"),
+                    meta_info.get("decode_execution_time"),
+                    meta_info.get("actual_execution_time"),
+                    meta_info.get("waiting_time"),
+                    meta_info.get("kv_transfer_time"),
+                    meta_info.get("mlfq_level"),
+                    meta_info.get("mlfq_tokens_in_level"),
+                )
+
             state.finished = recv_obj.finished_reasons[i] is not None
             if isinstance(recv_obj, BatchStrOutput):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
