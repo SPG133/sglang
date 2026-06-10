@@ -570,6 +570,10 @@ class Scheduler(
         self.init_batch_result_processor()
 
         self.is_initializing = False
+        # 独立 request timing 文件的去重集合。某些路径（尤其 overlap）
+        # 可能让同一 rid 以不同 Req 实例再次走到 finished 分支，
+        # 所以不能只依赖 req.timing_dumped。
+        self._dumped_request_timing_rids: set[str] = set()
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -2224,7 +2228,7 @@ class Scheduler(
 
     def _dump_request_timing_record(self, req: Req):
         """把 request 级执行画像额外落到独立文件，便于 benchmark 后单独分析。"""
-        if req.timing_dumped:
+        if req.timing_dumped or req.rid in self._dumped_request_timing_rids:
             return
         dump_path = os.environ.get(
             "SGLANG_REQUEST_TIMING_DUMP_FILE",
@@ -2251,6 +2255,7 @@ class Scheduler(
             with open(dump_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             req.timing_dumped = True
+            self._dumped_request_timing_rids.add(req.rid)
         except Exception:
             logger.exception("Failed to dump request timing record for rid=%s", req.rid)
 

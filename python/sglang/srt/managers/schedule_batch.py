@@ -1061,6 +1061,10 @@ class Req(ReqDllmMixin):
 
     def finalize_scheduler_timing(self, timestamp: Optional[float] = None):
         """在 request 完成/释放时收口总时间信息。"""
+        if self.release_time > 0.0:
+            # overlap / 延迟输出路径下，同一个 finished request 可能再次走到
+            # 收口逻辑。release_time / waiting_time 只应记录第一次完成时刻。
+            return
         end_time = timestamp if timestamp is not None else time.monotonic()
         self.actual_execution_time = (
             self.prefill_execution_time + self.decode_execution_time
