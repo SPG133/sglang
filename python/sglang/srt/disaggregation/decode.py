@@ -1473,6 +1473,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_topk_index,
             output_hidden_states,
             output_bootstrap_room,
+            output_prefill_timing_info,
         ) = self.metadata_buffers.get_buf(idx)
 
         # Validate bootstrap_room to detect context corruption
@@ -1524,6 +1525,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return
 
         self._commit_hicache_local_restore_to_req(decode_req)
+        prefill_timing_values = output_prefill_timing_info.cpu().tolist()
+        decode_req.req.pd_prefill_timing_info = {
+            name: float(value)
+            for name, value in zip(
+                self.metadata_buffers.prefill_timing_fields,
+                prefill_timing_values,
+            )
+        }
 
         # Case 3: Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
@@ -1708,6 +1717,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             # Reset so the next owner sees actual_room == 0 ("not yet written")
             # instead of the stale value, avoiding a false-positive mismatch.
             self.metadata_buffers.bootstrap_room[idx] = 0
+            self.metadata_buffers.prefill_timing_info[idx].zero_()
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -1842,7 +1852,7 @@ class SchedulerDisaggregationDecodeMixin:
         if len(self.waiting_queue) == 0:
             return None
 
-        if self.enable_priority_scheduling:
+        if self.enable_priority_scheduling or self._is_mlfq_enabled():
             self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         curr_batch_size = self.running_batch.batch_size()
@@ -1880,6 +1890,11 @@ class SchedulerDisaggregationDecodeMixin:
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:
             return None
+
+        if self._is_mlfq_enabled():
+            now = time.monotonic()
+            for req in can_run_list:
+                req.record_mlfq_dequeue(now)
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 

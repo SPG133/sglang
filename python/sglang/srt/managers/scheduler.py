@@ -2226,6 +2226,117 @@ class Scheduler(
         for req in batch.reqs:
             req.record_execution_end(now)
 
+    def _get_request_queue_timing_record(self, req: Req):
+        ts = req.time_stats
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            queue_entry_time = (
+                ts.prefill_bootstrap_queue_entry_time
+                or ts.wait_queue_entry_time
+                or req.scheduler_enqueue_time
+            )
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            queue_entry_time = (
+                ts.decode_prealloc_queue_entry_time
+                or ts.decode_transfer_queue_entry_time
+                or ts.wait_queue_entry_time
+                or req.scheduler_enqueue_time
+            )
+        else:
+            queue_entry_time = ts.wait_queue_entry_time or req.scheduler_enqueue_time
+
+        queue_dequeue_time = ts.forward_entry_time
+
+        def duration_between(start: float, end: float) -> float:
+            return max(0.0, end - start) if start > 0.0 and end > 0.0 else 0.0
+
+        return {
+            "timing_scope": self.disaggregation_mode.value,
+            "queue_entry_time": queue_entry_time,
+            "queue_dequeue_time": queue_dequeue_time,
+            "queue_duration": duration_between(queue_entry_time, queue_dequeue_time),
+            "scheduler_total_time": duration_between(
+                queue_entry_time, req.release_time
+            ),
+            "wait_queue_entry_time": ts.wait_queue_entry_time,
+            "forward_entry_time": ts.forward_entry_time,
+            "completion_time": ts.completion_time,
+            "prefill_bootstrap_queue_entry_time": ts.prefill_bootstrap_queue_entry_time,
+            "prefill_transfer_queue_entry_time": ts.prefill_transfer_queue_entry_time,
+            "prefill_kv_transfer_finish_time": ts.prefill_kv_transfer_finish_time,
+            "decode_prealloc_queue_entry_time": ts.decode_prealloc_queue_entry_time,
+            "decode_transfer_queue_entry_time": ts.decode_transfer_queue_entry_time,
+            "decode_prebuilt_finish_time": ts.decode_prebuilt_finish_time,
+            "bootstrap_done_time": ts.bootstrap_done_time,
+            "decode_prealloc_duration": duration_between(
+                ts.decode_prealloc_queue_entry_time,
+                ts.decode_transfer_queue_entry_time,
+            ),
+            "decode_transfer_duration": duration_between(
+                ts.decode_transfer_queue_entry_time,
+                ts.wait_queue_entry_time,
+            ),
+            "prefill_bootstrap_duration": duration_between(
+                ts.prefill_bootstrap_queue_entry_time,
+                ts.wait_queue_entry_time,
+            ),
+            "prefill_transfer_duration": duration_between(
+                ts.prefill_transfer_queue_entry_time,
+                ts.prefill_kv_transfer_finish_time,
+            ),
+        }
+
+    def _get_pd_prefill_timing_record(self, req: Req):
+        pd_prefill_timing_info = getattr(req, "pd_prefill_timing_info", None)
+        if not pd_prefill_timing_info:
+            return {}
+
+        def duration_between(start: float, end: float) -> float:
+            return max(0.0, end - start) if start > 0.0 and end > 0.0 else 0.0
+
+        prefill_execution_time = pd_prefill_timing_info.get(
+            "prefill_execution_time", 0.0
+        )
+        prefill_queue_entry_time = (
+            pd_prefill_timing_info.get("prefill_bootstrap_queue_entry_time", 0.0)
+            or pd_prefill_timing_info.get("prefill_wait_queue_entry_time", 0.0)
+            or pd_prefill_timing_info.get("prefill_scheduler_enqueue_time", 0.0)
+        )
+        prefill_forward_entry_time = pd_prefill_timing_info.get(
+            "prefill_forward_entry_time", 0.0
+        )
+        prefill_transfer_queue_entry_time = pd_prefill_timing_info.get(
+            "prefill_transfer_queue_entry_time", 0.0
+        )
+        prefill_kv_transfer_finish_time = pd_prefill_timing_info.get(
+            "prefill_kv_transfer_finish_time", 0.0
+        )
+
+        record = {
+            f"pd_{name}": value for name, value in pd_prefill_timing_info.items()
+        }
+        record.update(
+            {
+                "pd_actual_execution_time": (
+                    prefill_execution_time + req.decode_execution_time
+                ),
+                "pd_prefill_queue_entry_time": prefill_queue_entry_time,
+                "pd_prefill_queue_duration": duration_between(
+                    prefill_queue_entry_time,
+                    prefill_forward_entry_time,
+                ),
+                "pd_prefill_transfer_duration": duration_between(
+                    prefill_transfer_queue_entry_time,
+                    prefill_kv_transfer_finish_time,
+                ),
+                "pd_total_time_from_prefill_enqueue": duration_between(
+                    pd_prefill_timing_info.get("prefill_scheduler_enqueue_time", 0.0),
+                    req.release_time,
+                ),
+            }
+        )
+        return record
+
     def _dump_request_timing_record(self, req: Req):
         """把 request 级执行画像额外落到独立文件，便于 benchmark 后单独分析。"""
         if req.timing_dumped or req.rid in self._dumped_request_timing_rids:
@@ -2251,6 +2362,8 @@ class Scheduler(
                 req.finished_reason.to_json() if req.finished_reason else None
             ),
         }
+        record.update(self._get_request_queue_timing_record(req))
+        record.update(self._get_pd_prefill_timing_record(req))
         try:
             with open(dump_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")

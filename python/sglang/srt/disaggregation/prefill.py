@@ -604,8 +604,8 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
+                self.send_kv_chunk(req, last_chunk=True)
 
                 if req.grammar is not None:
                     try:

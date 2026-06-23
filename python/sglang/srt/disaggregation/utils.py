@@ -195,6 +195,23 @@ class ReqToMetadataIdxAllocator:
 
 
 class MetadataBuffers:
+    prefill_timing_fields = (
+        "prefill_scheduler_enqueue_time",
+        "prefill_bootstrap_queue_entry_time",
+        "prefill_wait_queue_entry_time",
+        "prefill_forward_entry_time",
+        "prefill_finished_time",
+        "prefill_transfer_queue_entry_time",
+        "prefill_kv_transfer_finish_time",
+        "prefill_execution_time",
+        "prefill_kv_transfer_time",
+        "prefill_actual_execution_time",
+        "prefill_mlfq_level",
+        "prefill_mlfq_tokens_in_level",
+        "prefill_prompt_len",
+        "prefill_output_len",
+    )
+
     def __init__(
         self,
         size: int,
@@ -255,6 +272,9 @@ class MetadataBuffers:
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
+            self.prefill_timing_info = torch.zeros(
+                (size, 16), dtype=torch.float64, device=device
+            )
 
     def get_buf_infos(self):
         ptrs = [
@@ -268,6 +288,7 @@ class MetadataBuffers:
             self.output_topk_index.data_ptr(),
             self.output_hidden_states.data_ptr(),
             self.bootstrap_room.data_ptr(),
+            self.prefill_timing_info.data_ptr(),
         ]
         data_lens = [
             self.output_ids.nbytes,
@@ -280,6 +301,7 @@ class MetadataBuffers:
             self.output_topk_index.nbytes,
             self.output_hidden_states.nbytes,
             self.bootstrap_room.nbytes,
+            self.prefill_timing_info.nbytes,
         ]
         item_lens = [
             self.output_ids[0].nbytes,
@@ -292,6 +314,7 @@ class MetadataBuffers:
             self.output_topk_index[0].nbytes,
             self.output_hidden_states[0].nbytes,
             self.bootstrap_room[0].nbytes,
+            self.prefill_timing_info[0].nbytes,
         ]
         return ptrs, data_lens, item_lens
 
@@ -307,6 +330,7 @@ class MetadataBuffers:
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
             self.bootstrap_room[idx].clone(),
+            self.prefill_timing_info[idx].clone(),
         )
 
     def set_buf(self, req: Req):
@@ -360,6 +384,28 @@ class MetadataBuffers:
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
+
+        ts = req.time_stats
+        prefill_timing_values = (
+            req.scheduler_enqueue_time,
+            ts.prefill_bootstrap_queue_entry_time,
+            ts.wait_queue_entry_time,
+            ts.forward_entry_time,
+            ts.prefill_finished_time,
+            ts.prefill_transfer_queue_entry_time,
+            ts.prefill_kv_transfer_finish_time,
+            req.prefill_execution_time,
+            req.kv_transfer_time,
+            req.actual_execution_time,
+            req.mlfq_level,
+            req.mlfq_tokens_in_level,
+            len(req.origin_input_ids),
+            len(req.output_ids),
+        )
+        timing_info = self.prefill_timing_info[req.metadata_buffer_index]
+        timing_info.zero_()
+        for i, value in enumerate(prefill_timing_values):
+            timing_info[i] = float(value or 0.0)
 
 
 #########################

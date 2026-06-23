@@ -968,6 +968,7 @@ class Req(ReqDllmMixin):
         self.timing_dumped = False
         self._execution_start_times = deque()
         self._kv_transfer_start_time: Optional[float] = None
+        self.pd_prefill_timing_info: Dict[str, float] = {}
 
         # MLFQ 状态：level 越小优先级越高，tokens_in_level 表示当前队列已消耗的量子。
         self.mlfq_level = 0
