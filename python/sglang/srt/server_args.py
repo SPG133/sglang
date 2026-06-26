@@ -434,7 +434,7 @@ class ServerArgs:
     requested_schedule_policy: Optional[str] = None
     effective_schedule_policy: Optional[str] = None
     mlfq_quanta: str = "1,2,4"
-    mlfq_starvation_seconds: float = 1.0
+    mlfq_starvation_seconds: float = 10.0
     mlfq_prefill_thresholds: str = "32,256"
     mlfq_decode_thresholds: str = "32,256"
     mlfq_elastic_slowdown_multiplier: Optional[float] = None
