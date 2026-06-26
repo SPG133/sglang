@@ -331,6 +331,7 @@ class Scheduler(
             server_args, "effective_schedule_policy", None
         ) or self.requested_schedule_policy
         self.schedule_policy = self.effective_schedule_policy
+        self.disaggregation_mode = DisaggregationMode(server_args.disaggregation_mode)
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
             server_args.abort_on_priority_when_disabled
@@ -2237,9 +2238,14 @@ class Scheduler(
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
     def is_decode_mlfq_enabled(self) -> bool:
+        disaggregation_mode = getattr(self, "disaggregation_mode", None)
+        if disaggregation_mode is None:
+            disaggregation_mode = DisaggregationMode(
+                self.server_args.disaggregation_mode
+            )
         return (
             self.effective_schedule_policy == "mlfq"
-            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and disaggregation_mode == DisaggregationMode.DECODE
         )
 
     def _is_mlfq_enabled(self) -> bool:
