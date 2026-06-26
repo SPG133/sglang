@@ -1576,7 +1576,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 prefill_timing_values,
             )
         }
-        if schema_version == PREFILL_TIMING_SCHEMA_VERSION:
+        if (
+            schema_version == PREFILL_TIMING_SCHEMA_VERSION
+            and int(
+                decode_req.req.pd_prefill_timing_info.get(
+                    "prefill_mlfq_state_valid", 0
+                )
+            )
+        ):
             decode_req.req.mlfq_level = int(
                 decode_req.req.pd_prefill_timing_info["prefill_mlfq_level"]
             )
@@ -1584,6 +1591,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 decode_req.req.pd_prefill_timing_info[
                     "prefill_mlfq_tokens_in_level"
                 ]
+            )
+        elif self.scheduler.schedule_policy == "mlfq":
+            logger.info(
+                "Prefill metadata has no valid MLFQ state for rid=%s; "
+                "using decode-side MLFQ fallback state.",
+                decode_req.req.rid,
             )
 
         # Case 3: Success - commit the transfer

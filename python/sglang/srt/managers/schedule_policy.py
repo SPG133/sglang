@@ -427,6 +427,8 @@ class SchedulePolicy:
 
     def _assign_mlfq_levels_from_current_work(self, waiting_queue: List[Req]) -> None:
         server_args = get_global_server_args()
+        if server_args.disaggregation_mode == "decode":
+            return
         chunked_prefill_size = server_args.chunked_prefill_size
         for req in waiting_queue:
             if req.retracted_stain or getattr(req, "mlfq_classified_for_queue", False):

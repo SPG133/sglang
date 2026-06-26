@@ -580,6 +580,10 @@ class Scheduler(
         self._dumped_request_timing_order: deque[str] = deque()
         if self.server_args.enable_request_timing_dump:
             os.makedirs(self._get_request_timing_dump_dir(), exist_ok=True)
+        self._dumped_request_io_rids: set[str] = set()
+        self._dumped_request_io_order: deque[str] = deque()
+        if self.server_args.enable_request_io_dump:
+            os.makedirs(self._get_request_io_dump_dir(), exist_ok=True)
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -2207,7 +2211,10 @@ class Scheduler(
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
     def _is_mlfq_enabled(self) -> bool:
-        return self.schedule_policy == "mlfq"
+        return (
+            self.schedule_policy == "mlfq"
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        )
 
     def _prepare_mlfq_enqueue(self, req: Req, is_retracted: bool = False):
         # Skip-join 只用于新到达请求；retract 回来的请求保留当前队列等级，
@@ -2441,12 +2448,73 @@ class Scheduler(
             or os.path.expanduser("~/sglang")
         )
 
+    def _dump_request_io_record(self, req: Req):
+        if not self.server_args.enable_request_io_dump:
+            return
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return
+        if req.rid in self._dumped_request_io_rids:
+            return
+
+        dump_dir = self._get_request_io_dump_dir()
+        os.makedirs(dump_dir, exist_ok=True)
+        dump_path = os.path.join(
+            dump_dir,
+            f"request_io_rank{self.tp_rank}_pid{os.getpid()}.jsonl",
+        )
+        input_ids = list(req.origin_input_ids)
+        output_ids = list(req.output_ids_through_stop)
+        record = {
+            "schema_version": 1,
+            "hostname": get_clock_domain_id().split(":", 1)[0],
+            "clock_domain": get_clock_domain_id(),
+            "pid": os.getpid(),
+            "scheduler_rank": self.tp_rank,
+            "scheduler_role": self.disaggregation_mode.value,
+            "disaggregation_mode": self.disaggregation_mode.value,
+            "schedule_policy": self.schedule_policy,
+            "rid": req.rid,
+            "input_ids": input_ids,
+            "output_ids": output_ids,
+            "input_len": len(input_ids),
+            "output_len": len(output_ids),
+            "decoded_output_text": getattr(req, "decoded_text", None),
+            "decoded_input_text": None,
+            "decoded_input_text_unavailable_reason": (
+                "scheduler_keeps_token_ids_not_original_text"
+            ),
+            "finished_reason": (
+                req.finished_reason.to_json() if req.finished_reason else None
+            ),
+        }
+        try:
+            with open(dump_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self._dumped_request_io_rids.add(req.rid)
+            self._dumped_request_io_order.append(req.rid)
+            while (
+                len(self._dumped_request_io_order)
+                > self.server_args.request_io_dedup_capacity
+            ):
+                old_rid = self._dumped_request_io_order.popleft()
+                self._dumped_request_io_rids.discard(old_rid)
+        except Exception:
+            logger.exception("Failed to dump request I/O record for rid=%s", req.rid)
+
+    def _get_request_io_dump_dir(self) -> str:
+        return (
+            self.server_args.request_io_dump_dir
+            or os.environ.get("SGLANG_REQUEST_IO_DUMP_DIR")
+            or os.path.expanduser("~/sglang")
+        )
+
     def _finalize_finished_request_timing(self, batch: ScheduleBatch):
         now = time.monotonic()
         for req in batch.reqs:
             if req.finished():
                 req.finalize_scheduler_timing(now)
                 self._dump_request_timing_record(req)
+                self._dump_request_io_record(req)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""

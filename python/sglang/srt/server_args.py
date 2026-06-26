@@ -513,6 +513,9 @@ class ServerArgs:
     enable_request_timing_dump: bool = False
     request_timing_dump_dir: Optional[str] = None
     request_timing_dedup_capacity: int = 100000
+    enable_request_io_dump: bool = False
+    request_io_dump_dir: Optional[str] = None
+    request_io_dedup_capacity: int = 100000
     enable_trace: bool = False
     trace_modules: str = "request"
     otlp_traces_endpoint: str = "localhost:4317"
@@ -5375,6 +5378,30 @@ class ServerArgs:
             help="Maximum number of finished request ids retained for timing dump deduplication.",
         )
         parser.add_argument(
+            "--enable-request-io-dump",
+            action="store_true",
+            default=ServerArgs.enable_request_io_dump,
+            help=(
+                "Enable JSONL dump of completed request input/output token ids. "
+                "PD prefill workers intentionally do not emit this dump."
+            ),
+        )
+        parser.add_argument(
+            "--request-io-dump-dir",
+            type=str,
+            default=ServerArgs.request_io_dump_dir,
+            help=(
+                "Directory for --enable-request-io-dump output. Defaults to "
+                "SGLANG_REQUEST_IO_DUMP_DIR or ~/sglang."
+            ),
+        )
+        parser.add_argument(
+            "--request-io-dedup-capacity",
+            type=int,
+            default=ServerArgs.request_io_dedup_capacity,
+            help="Maximum number of finished request ids retained for request I/O dump deduplication.",
+        )
+        parser.add_argument(
             "--kv-events-config",
             type=str,
             default=None,
@@ -7547,6 +7574,9 @@ class ServerArgs:
         assert (
             self.request_timing_dedup_capacity > 0
         ), "--request-timing-dedup-capacity must be positive."
+        assert (
+            self.request_io_dedup_capacity > 0
+        ), "--request-io-dedup-capacity must be positive."
 
         if self.enable_priority_scheduling:
             assert self.schedule_policy in [

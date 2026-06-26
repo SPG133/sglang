@@ -73,6 +73,22 @@ class TestPrepareServerArgs(CustomTestCase):
                 ]
             )
 
+    def test_request_io_dump_cli_args(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                "--enable-request-io-dump",
+                "--request-io-dump-dir",
+                "./io_dump",
+                "--request-io-dedup-capacity",
+                "123",
+            ]
+        )
+        self.assertTrue(server_args.enable_request_io_dump)
+        self.assertEqual(server_args.request_io_dump_dir, "./io_dump")
+        self.assertEqual(server_args.request_io_dedup_capacity, 123)
+
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):
