@@ -90,6 +90,7 @@ from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_av
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
+from sglang.srt.managers.mlfq import MLFQConfig
 
 logger = logging.getLogger(__name__)
 
@@ -430,6 +431,9 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
+    mlfq_quanta: str = "1,2,4"
+    mlfq_starvation_seconds: float = 1.0
+    mlfq_prefill_thresholds: str = "32,256"
     enable_priority_scheduling: bool = False
     disable_priority_preemption: bool = False
     default_priority_value: Optional[int] = None
@@ -506,6 +510,9 @@ class ServerArgs:
     enable_forward_pass_metrics: bool = False
     forward_pass_metrics_worker_id: str = ""
     forward_pass_metrics_ipc_name: Optional[str] = None
+    enable_request_timing_dump: bool = False
+    request_timing_dump_dir: Optional[str] = None
+    request_timing_dedup_capacity: int = 100000
     enable_trace: bool = False
     trace_modules: str = "request"
     otlp_traces_endpoint: str = "localhost:4317"
@@ -4848,7 +4855,39 @@ class ServerArgs:
                 "routing-key",
                 "mlfq",
             ],
-            help="The scheduling policy of the requests.",
+            help=(
+                "The scheduling policy of the requests. The 'mlfq' policy is "
+                "MLFQ admission scheduling: it orders queued admission work and "
+                "does not preempt requests already in a running decode batch."
+            ),
+        )
+        parser.add_argument(
+            "--mlfq-quanta",
+            type=str,
+            default=ServerArgs.mlfq_quanta,
+            help=(
+                "Comma-separated positive integer quanta for MLFQ admission "
+                "levels, e.g. '1,2,4'. Used only with --schedule-policy mlfq."
+            ),
+        )
+        parser.add_argument(
+            "--mlfq-starvation-seconds",
+            type=float,
+            default=ServerArgs.mlfq_starvation_seconds,
+            help=(
+                "Positive queue-residence seconds before an MLFQ queued request "
+                "is promoted. Used only with --schedule-policy mlfq."
+            ),
+        )
+        parser.add_argument(
+            "--mlfq-prefill-thresholds",
+            type=str,
+            default=ServerArgs.mlfq_prefill_thresholds,
+            help=(
+                "Comma-separated positive, strictly increasing prefill work "
+                "thresholds for initial MLFQ levels, e.g. '32,256'. The count "
+                "must be one fewer than --mlfq-quanta."
+            ),
         )
         parser.add_argument(
             "--enable-priority-scheduling",
@@ -5313,6 +5352,27 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_request_time_stats_logging,
             help="Enable per request time stats logging",
+        )
+        parser.add_argument(
+            "--enable-request-timing-dump",
+            action="store_true",
+            default=ServerArgs.enable_request_timing_dump,
+            help="Enable JSONL request timing dump for scheduler diagnostics.",
+        )
+        parser.add_argument(
+            "--request-timing-dump-dir",
+            type=str,
+            default=ServerArgs.request_timing_dump_dir,
+            help=(
+                "Directory for --enable-request-timing-dump output. Defaults "
+                "to SGLANG_REQUEST_TIMING_DUMP_DIR or ~/sglang."
+            ),
+        )
+        parser.add_argument(
+            "--request-timing-dedup-capacity",
+            type=int,
+            default=ServerArgs.request_timing_dedup_capacity,
+            help="Maximum number of finished request ids retained for timing dump deduplication.",
         )
         parser.add_argument(
             "--kv-events-config",
@@ -7479,6 +7539,15 @@ class ServerArgs:
         )
 
         # Check scheduling policy
+        try:
+            MLFQConfig.from_server_args(self)
+        except ValueError as exc:
+            raise ValueError(f"Invalid MLFQ configuration: {exc}") from exc
+
+        assert (
+            self.request_timing_dedup_capacity > 0
+        ), "--request-timing-dedup-capacity must be positive."
+
         if self.enable_priority_scheduling:
             assert self.schedule_policy in [
                 "fcfs",

@@ -62,6 +62,8 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_clock_domain_id,
+    get_clock_domain_hash,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -168,6 +170,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.mlfq import MLFQConfig
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -574,6 +577,9 @@ class Scheduler(
         # 可能让同一 rid 以不同 Req 实例再次走到 finished 分支，
         # 所以不能只依赖 req.timing_dumped。
         self._dumped_request_timing_rids: set[str] = set()
+        self._dumped_request_timing_order: deque[str] = deque()
+        if self.server_args.enable_request_timing_dump:
+            os.makedirs(self._get_request_timing_dump_dir(), exist_ok=True)
 
     def init_zbal_on_npu(self):
         if _is_npu:
@@ -962,12 +968,14 @@ class Scheduler(
 
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
+        self.mlfq_config = MLFQConfig.from_server_args(self.server_args)
         self.policy = SchedulePolicy(
             self.schedule_policy,
             self.tree_cache,
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            self.mlfq_config,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: int = 0
@@ -2205,26 +2213,32 @@ class Scheduler(
         # Skip-join 只用于新到达请求；retract 回来的请求保留当前队列等级，
         # 否则每次 OOM 后都会被重置到最高队列，反馈队列就失效了。
         if not is_retracted:
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                next_iter_tokens = 1
-            else:
-                next_iter_tokens = max(1, len(req.origin_input_ids))
-            req.assign_mlfq_level_for_next_iter(next_iter_tokens)
+            req.mlfq_level = self.mlfq_config.num_levels - 1
+            req.mlfq_tokens_in_level = 0
         req.record_mlfq_enqueue()
 
     def _record_batch_execution_start(self, batch: ScheduleBatch):
         now = time.monotonic()
         decode_reqs = set(batch.decoding_reqs or [])
         is_decode_batch = batch.forward_mode.is_decode()
-        for req in batch.reqs:
+        spans = []
+        for req in list(batch.reqs):
             # 混合 chunked prefill 中，batch.forward_mode 是 extend，但 decoding_reqs
             # 里的请求实际执行的是 decode step。
-            req.record_execution_start(is_decode_batch or req in decode_reqs, now)
+            span_id = req.record_execution_start(
+                is_decode_batch or req in decode_reqs, now
+            )
+            spans.append((req, span_id))
+        batch._request_timing_spans = spans
 
     def _record_batch_execution_end(self, batch: ScheduleBatch):
         now = time.monotonic()
-        for req in batch.reqs:
-            req.record_execution_end(now)
+        spans = getattr(batch, "_request_timing_spans", None)
+        if spans is None:
+            spans = [(req, None) for req in list(batch.reqs)]
+        for req, span_id in spans:
+            req.record_execution_end(span_id, now)
+        batch._request_timing_spans = []
 
     def _get_request_queue_timing_record(self, req: Req):
         ts = req.time_stats
@@ -2294,8 +2308,9 @@ class Scheduler(
         def duration_between(start: float, end: float) -> float:
             return max(0.0, end - start) if start > 0.0 and end > 0.0 else 0.0
 
-        prefill_execution_time = pd_prefill_timing_info.get(
-            "prefill_execution_time", 0.0
+        prefill_batch_wall_time_attributed = pd_prefill_timing_info.get(
+            "prefill_batch_wall_time_attributed",
+            pd_prefill_timing_info.get("prefill_execution_time", 0.0),
         )
         prefill_queue_entry_time = (
             pd_prefill_timing_info.get("prefill_bootstrap_queue_entry_time", 0.0)
@@ -2311,14 +2326,30 @@ class Scheduler(
         prefill_kv_transfer_finish_time = pd_prefill_timing_info.get(
             "prefill_kv_transfer_finish_time", 0.0
         )
+        prefill_clock_domain_hash = int(
+            pd_prefill_timing_info.get("prefill_clock_domain_hash", -1)
+        )
+        same_clock_domain = prefill_clock_domain_hash == get_clock_domain_hash()
+        pd_total_time_from_prefill_enqueue = (
+            duration_between(
+                pd_prefill_timing_info.get("prefill_scheduler_enqueue_time", 0.0),
+                req.release_time,
+            )
+            if same_clock_domain
+            else None
+        )
 
         record = {
             f"pd_{name}": value for name, value in pd_prefill_timing_info.items()
         }
         record.update(
             {
-                "pd_actual_execution_time": (
-                    prefill_execution_time + req.decode_execution_time
+                "pd_attributed_batch_wall_time": (
+                    prefill_batch_wall_time_attributed
+                    + req.decode_batch_wall_time_attributed
+                ),
+                "pd_actual_execution_time_deprecated": (
+                    prefill_batch_wall_time_attributed + req.decode_execution_time
                 ),
                 "pd_prefill_queue_entry_time": prefill_queue_entry_time,
                 "pd_prefill_queue_duration": duration_between(
@@ -2329,9 +2360,13 @@ class Scheduler(
                     prefill_transfer_queue_entry_time,
                     prefill_kv_transfer_finish_time,
                 ),
-                "pd_total_time_from_prefill_enqueue": duration_between(
-                    pd_prefill_timing_info.get("prefill_scheduler_enqueue_time", 0.0),
-                    req.release_time,
+                "pd_total_time_from_prefill_enqueue": (
+                    pd_total_time_from_prefill_enqueue
+                ),
+                "pd_total_time_unavailable_reason": (
+                    None
+                    if same_clock_domain
+                    else "prefill_decode_clock_domain_mismatch"
                 ),
             }
         )
@@ -2339,20 +2374,40 @@ class Scheduler(
 
     def _dump_request_timing_record(self, req: Req):
         """把 request 级执行画像额外落到独立文件，便于 benchmark 后单独分析。"""
+        if not self.server_args.enable_request_timing_dump:
+            return
         if req.timing_dumped or req.rid in self._dumped_request_timing_rids:
             return
-        dump_path = os.environ.get(
-            "SGLANG_REQUEST_TIMING_DUMP_FILE",
-            os.path.expanduser("~/sglang/request_timing.jsonl"),
+        dump_dir = self._get_request_timing_dump_dir()
+        os.makedirs(dump_dir, exist_ok=True)
+        dump_path = os.path.join(
+            dump_dir,
+            f"request_timing_rank{self.tp_rank}_pid{os.getpid()}.jsonl",
         )
         record = {
+            "schema_version": 2,
+            "hostname": get_clock_domain_id().split(":", 1)[0],
+            "clock_domain": get_clock_domain_id(),
+            "pid": os.getpid(),
+            "scheduler_rank": self.tp_rank,
+            "scheduler_role": self.disaggregation_mode.value,
+            "disaggregation_mode": self.disaggregation_mode.value,
+            "schedule_policy": self.schedule_policy,
             "rid": req.rid,
             "scheduler_enqueue_time": req.scheduler_enqueue_time,
             "release_time": req.release_time,
-            "prefill_execution_time": req.prefill_execution_time,
-            "decode_execution_time": req.decode_execution_time,
-            "actual_execution_time": req.actual_execution_time,
-            "waiting_time": req.waiting_time,
+            "prefill_batch_wall_time_attributed": (
+                req.prefill_batch_wall_time_attributed
+            ),
+            "decode_batch_wall_time_attributed": (
+                req.decode_batch_wall_time_attributed
+            ),
+            "attributed_batch_wall_time": req.attributed_batch_wall_time,
+            "prefill_execution_time_deprecated": req.prefill_execution_time,
+            "decode_execution_time_deprecated": req.decode_execution_time,
+            "actual_execution_time_deprecated": req.actual_execution_time,
+            "queue_wait_duration": req.queue_wait_duration,
+            "unaccounted_wall_time": req.unaccounted_wall_time,
             "kv_transfer_time": req.kv_transfer_time,
             "mlfq_level": req.mlfq_level,
             "mlfq_tokens_in_level": req.mlfq_tokens_in_level,
@@ -2369,8 +2424,22 @@ class Scheduler(
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             req.timing_dumped = True
             self._dumped_request_timing_rids.add(req.rid)
+            self._dumped_request_timing_order.append(req.rid)
+            while (
+                len(self._dumped_request_timing_order)
+                > self.server_args.request_timing_dedup_capacity
+            ):
+                old_rid = self._dumped_request_timing_order.popleft()
+                self._dumped_request_timing_rids.discard(old_rid)
         except Exception:
             logger.exception("Failed to dump request timing record for rid=%s", req.rid)
+
+    def _get_request_timing_dump_dir(self) -> str:
+        return (
+            self.server_args.request_timing_dump_dir
+            or os.environ.get("SGLANG_REQUEST_TIMING_DUMP_DIR")
+            or os.path.expanduser("~/sglang")
+        )
 
     def _finalize_finished_request_timing(self, batch: ScheduleBatch):
         now = time.monotonic()
@@ -2882,6 +2951,15 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if (
+                self._is_mlfq_enabled()
+                and len(adder.can_run_list) > 0
+                and req is adder.can_run_list[-1]
+                and not req.retracted_stain
+            ):
+                req.assign_mlfq_level_for_next_iter(
+                    req.extend_input_len, self.mlfq_config
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -2923,7 +3001,9 @@ class Scheduler(
             now = time.monotonic()
             for req in can_run_list:
                 req.record_mlfq_dequeue(now)
-                req.update_mlfq_after_schedule(req.extend_input_len)
+                req.update_mlfq_after_schedule(
+                    req.extend_input_len, self.mlfq_config
+                )
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
@@ -3120,7 +3200,7 @@ class Scheduler(
         batch.prepare_for_decode()
         if self._is_mlfq_enabled():
             for req in batch.reqs:
-                req.update_mlfq_after_schedule(1)
+                req.update_mlfq_after_schedule(1, self.mlfq_config)
         return batch
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
@@ -3199,7 +3279,11 @@ class Scheduler(
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
-            return self._run_batch_prebuilt(batch)
+            self._record_batch_execution_start(batch)
+            try:
+                return self._run_batch_prebuilt(batch)
+            finally:
+                self._record_batch_execution_end(batch)
 
         # Run forward
         self._record_batch_execution_start(batch)
@@ -3234,9 +3318,12 @@ class Scheduler(
                         )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
+                        try:
+                            batch_result = self.model_worker.forward_batch_generation(
+                                batch, **fwd_kwargs
+                            )
+                        finally:
+                            self._record_batch_execution_end(batch)
                         if not batch.is_spec_v2:
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -3270,7 +3357,10 @@ class Scheduler(
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                try:
+                    batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                finally:
+                    self._record_batch_execution_end(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
                     self.future_map.stash(
                         batch.req_pool_indices, batch_result.next_token_ids
@@ -3283,9 +3373,12 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
-                )
+                try:
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
+                finally:
+                    self._record_batch_execution_end(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
                     if self.spec_algorithm.is_none():
                         # Non-spec: relay via future_map, gathered next iter.
@@ -3321,7 +3414,10 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     resolve_forward_inputs(batch, self.future_map)
-                    pooler_output = self.tp_worker.forward_batch_embedding(batch)
+                    try:
+                        pooler_output = self.tp_worker.forward_batch_embedding(batch)
+                    finally:
+                        self._record_batch_execution_end(batch)
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
@@ -3329,7 +3425,10 @@ class Scheduler(
                     ret.copy_to_cpu()
             else:
                 resolve_forward_inputs(batch, self.future_map)
-                pooler_output = self.tp_worker.forward_batch_embedding(batch)
+                try:
+                    pooler_output = self.tp_worker.forward_batch_embedding(batch)
+                finally:
+                    self._record_batch_execution_end(batch)
                 ret = EmbeddingBatchResult(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,

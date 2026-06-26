@@ -41,7 +41,6 @@ import logging
 import re
 import time
 from array import array
-from collections import deque
 from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
@@ -74,6 +73,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
+from sglang.srt.managers.mlfq import MLFQConfig
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -959,22 +959,30 @@ class Req(ReqDllmMixin):
         # waiting_time: 总完成时间减去执行时间与 KV 传输时间后的等待时间。
         self.scheduler_enqueue_time = time.monotonic()
         self.scheduler_enqueue_recorded = False
+        self.prefill_batch_wall_time_attributed = 0.0
+        self.decode_batch_wall_time_attributed = 0.0
         self.prefill_execution_time = 0.0
         self.decode_execution_time = 0.0
         self.kv_transfer_time = 0.0
+        self.attributed_batch_wall_time = 0.0
         self.actual_execution_time = 0.0
-        self.waiting_time = 0.0
+        self.queue_wait_duration = None
+        self.unaccounted_wall_time = None
+        self.waiting_time = None
         self.release_time = 0.0
         self.timing_dumped = False
-        self._execution_start_times = deque()
+        self._execution_spans = {}
+        self._next_execution_span_id = 0
         self._kv_transfer_start_time: Optional[float] = None
         self.pd_prefill_timing_info: Dict[str, float] = {}
 
         # MLFQ 状态：level 越小优先级越高，tokens_in_level 表示当前队列已消耗的量子。
         self.mlfq_level = 0
         self.mlfq_tokens_in_level = 0
-        self.mlfq_last_queued_time = self.scheduler_enqueue_time
-        self.mlfq_starve_time = 0.0
+        self.mlfq_queue_enter_time = self.scheduler_enqueue_time
+        self.mlfq_is_queued = False
+        self.mlfq_last_wait_duration = 0.0
+        self.mlfq_classified_for_queue = False
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -1021,30 +1029,42 @@ class Req(ReqDllmMixin):
             timestamp if timestamp is not None else time.monotonic()
         )
         self.scheduler_enqueue_recorded = True
-        self.mlfq_last_queued_time = self.scheduler_enqueue_time
-        self.mlfq_starve_time = 0.0
+        self.mlfq_queue_enter_time = self.scheduler_enqueue_time
+        self.mlfq_is_queued = False
+        self.mlfq_last_wait_duration = 0.0
+        self.mlfq_classified_for_queue = False
 
     def record_execution_start(
         self, is_decode: bool, timestamp: Optional[float] = None
     ):
         """记录一次 prefill/decode step 的 GPU 开始时间。"""
         start_time = timestamp if timestamp is not None else time.monotonic()
-        self._execution_start_times.append((start_time, is_decode))
+        span_id = self._next_execution_span_id
+        self._next_execution_span_id += 1
+        self._execution_spans[span_id] = (start_time, is_decode)
+        return span_id
 
-    def record_execution_end(self, timestamp: Optional[float] = None):
+    def record_execution_end(self, span_id=None, timestamp: Optional[float] = None):
         """结束最近一次 prefill/decode step，并把耗时累加到对应阶段。"""
-        if not self._execution_start_times:
+        if span_id is None:
             return
-        start_time, is_decode = self._execution_start_times.popleft()
+        span = self._execution_spans.pop(span_id, None)
+        if span is None:
+            return
+        start_time, is_decode = span
         end_time = timestamp if timestamp is not None else time.monotonic()
         elapsed = max(0.0, end_time - start_time)
         if is_decode:
-            self.decode_execution_time += elapsed
+            self.decode_batch_wall_time_attributed += elapsed
         else:
-            self.prefill_execution_time += elapsed
-        self.actual_execution_time = (
-            self.prefill_execution_time + self.decode_execution_time
+            self.prefill_batch_wall_time_attributed += elapsed
+        self.attributed_batch_wall_time = (
+            self.prefill_batch_wall_time_attributed
+            + self.decode_batch_wall_time_attributed
         )
+        self.prefill_execution_time = self.prefill_batch_wall_time_attributed
+        self.decode_execution_time = self.decode_batch_wall_time_attributed
+        self.actual_execution_time = self.attributed_batch_wall_time
 
     def record_kv_transfer_start(self, timestamp: Optional[float] = None):
         """开始记录一次 KV 传输。"""
@@ -1067,50 +1087,60 @@ class Req(ReqDllmMixin):
             # 收口逻辑。release_time / waiting_time 只应记录第一次完成时刻。
             return
         end_time = timestamp if timestamp is not None else time.monotonic()
-        self.actual_execution_time = (
-            self.prefill_execution_time + self.decode_execution_time
+        self.attributed_batch_wall_time = (
+            self.prefill_batch_wall_time_attributed
+            + self.decode_batch_wall_time_attributed
         )
+        self.prefill_execution_time = self.prefill_batch_wall_time_attributed
+        self.decode_execution_time = self.decode_batch_wall_time_attributed
+        self.actual_execution_time = self.attributed_batch_wall_time
         self.release_time = end_time
         total_time = max(0.0, end_time - self.scheduler_enqueue_time)
-        self.waiting_time = max(
-            0.0, total_time - self.actual_execution_time - self.kv_transfer_time
+        self.unaccounted_wall_time = (
+            total_time - self.attributed_batch_wall_time - self.kv_transfer_time
         )
 
     def record_mlfq_enqueue(self, timestamp: Optional[float] = None):
         """记录 request 重新进入某个 MLFQ 队列的时间。"""
         now = timestamp if timestamp is not None else time.monotonic()
-        self.mlfq_last_queued_time = now
-        self.mlfq_starve_time = 0.0
+        self.mlfq_queue_enter_time = now
+        self.mlfq_is_queued = True
+        self.mlfq_classified_for_queue = False
 
     def record_mlfq_dequeue(self, timestamp: Optional[float] = None):
         """记录 request 离开 MLFQ 队列参与调度。"""
+        if not self.mlfq_is_queued:
+            return
         now = timestamp if timestamp is not None else time.monotonic()
-        self.mlfq_starve_time += max(0.0, now - self.mlfq_last_queued_time)
+        self.mlfq_last_wait_duration = max(0.0, now - self.mlfq_queue_enter_time)
+        self.mlfq_is_queued = False
 
     def record_mlfq_starvation(self, timestamp: Optional[float] = None):
         """累计 request 在等待队列中的饥饿时间。"""
         now = timestamp if timestamp is not None else time.monotonic()
-        self.mlfq_starve_time += max(0.0, now - self.mlfq_last_queued_time)
-        self.mlfq_last_queued_time = now
+        if self.mlfq_is_queued:
+            self.mlfq_last_wait_duration = max(
+                0.0, now - self.mlfq_queue_enter_time
+            )
 
-    def assign_mlfq_level_for_next_iter(self, next_iter_tokens: int):
+    def assign_mlfq_level_for_next_iter(
+        self, next_iter_tokens: int, config: Optional[MLFQConfig] = None
+    ):
         """按下一轮预计 token 数做 skip-join 分层。"""
-        if next_iter_tokens <= 1:
-            self.mlfq_level = 0
-        elif next_iter_tokens <= 2:
-            self.mlfq_level = 1
-        else:
-            self.mlfq_level = 2
+        config = config or MLFQConfig()
+        self.mlfq_level = config.level_for_prefill_work(next_iter_tokens)
         self.mlfq_tokens_in_level = 0
+        self.mlfq_classified_for_queue = True
 
-    def update_mlfq_after_schedule(self, scheduled_tokens: int):
+    def update_mlfq_after_schedule(
+        self, scheduled_tokens: int, config: Optional[MLFQConfig] = None
+    ):
         """量子耗尽则降级，decode 每步通常按 1 token 记账。"""
-        mlfq_quanta = (1, 2, 4)
+        config = config or MLFQConfig()
         self.mlfq_tokens_in_level += max(1, scheduled_tokens)
-        quantum = mlfq_quanta[min(self.mlfq_level, len(mlfq_quanta) - 1)]
-        if self.mlfq_tokens_in_level >= quantum:
-            self.mlfq_level = min(self.mlfq_level + 1, len(mlfq_quanta) - 1)
-            self.mlfq_tokens_in_level = 0
+        self.mlfq_level, self.mlfq_tokens_in_level = config.next_level_after_service(
+            self.mlfq_level, self.mlfq_tokens_in_level
+        )
 
     @property
     def seqlen(self) -> int:

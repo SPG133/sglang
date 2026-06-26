@@ -38,6 +38,41 @@ class TestPrepareServerArgs(CustomTestCase):
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
 
+    def test_mlfq_cli_args(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                "--schedule-policy",
+                "mlfq",
+                "--mlfq-quanta",
+                "2,4,8",
+                "--mlfq-prefill-thresholds",
+                "64,512",
+                "--mlfq-starvation-seconds",
+                "3.5",
+            ]
+        )
+        self.assertEqual(server_args.schedule_policy, "mlfq")
+        self.assertEqual(server_args.mlfq_quanta, "2,4,8")
+        self.assertEqual(server_args.mlfq_prefill_thresholds, "64,512")
+        self.assertEqual(server_args.mlfq_starvation_seconds, 3.5)
+
+    def test_mlfq_invalid_cli_args(self):
+        with self.assertRaises(ValueError):
+            prepare_server_args(
+                [
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                    "--schedule-policy",
+                    "mlfq",
+                    "--mlfq-quanta",
+                    "1,2,4",
+                    "--mlfq-prefill-thresholds",
+                    "32",
+                ]
+            )
+
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):

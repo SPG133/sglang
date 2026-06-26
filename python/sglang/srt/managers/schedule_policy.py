@@ -38,6 +38,11 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
+from sglang.srt.managers.mlfq import (
+    MLFQConfig,
+    mlfq_sort_key,
+    promote_starved_requests,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -83,11 +88,6 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 IGNORE_EOS_RESERVE_TOKENS = 1
 
 # MLFQ 的实验参数：队列号越小优先级越高，量子越小越偏向短任务/短 decode 步。
-MLFQ_NUM_LEVELS = 3
-MLFQ_QUANTA = (1, 2, 4)
-MLFQ_STARVATION_SECONDS = 1.0
-
-
 def match_prefix_for_req(
     tree_cache: BasePrefixCache,
     req: Req,
@@ -163,6 +163,7 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        mlfq_config: Optional[MLFQConfig] = None,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -170,6 +171,7 @@ class SchedulePolicy:
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+        self.mlfq_config = mlfq_config or MLFQConfig()
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -227,8 +229,9 @@ class SchedulePolicy:
             elif policy == CacheAgnosticPolicy.MLFQ:
                 # MLFQ 只重排等待队列；运行中的 decode batch 不在这里直接打乱，
                 # 避免破坏已有 batch 张量顺序。
-                SchedulePolicy._promote_starved_mlfq_requests(waiting_queue)
-                SchedulePolicy._sort_by_mlfq(waiting_queue)
+                self._assign_mlfq_levels_from_current_work(waiting_queue)
+                promote_starved_requests(waiting_queue, self.mlfq_config)
+                self._sort_by_mlfq(waiting_queue)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
@@ -406,31 +409,34 @@ class SchedulePolicy:
             waiting_keys_after = [r.routing_key for r in waiting_queue]
             logger.info(f"waiting_keys_after={waiting_keys_after}")
 
-    @staticmethod
-    def _promote_starved_mlfq_requests(waiting_queue: List[Req]) -> None:
+    def _promote_starved_mlfq_requests(self, waiting_queue: List[Req]) -> None:
         now = time.monotonic()
         for req in waiting_queue:
             if not hasattr(req, "record_mlfq_starvation"):
                 continue
             req.record_mlfq_starvation(now)
-            if req.mlfq_starve_time >= MLFQ_STARVATION_SECONDS:
+            if req.mlfq_last_wait_duration >= self.mlfq_config.starvation_seconds:
                 # 饥饿提升：等待超过阈值的请求回到最高优先级队列。
                 req.mlfq_level = 0
                 req.mlfq_tokens_in_level = 0
-                req.mlfq_starve_time = 0.0
-                req.mlfq_last_queued_time = now
+                req.mlfq_queue_enter_time = now
 
-    @staticmethod
-    def _sort_by_mlfq(waiting_queue: List[Req]) -> None:
+    def _sort_by_mlfq(self, waiting_queue: List[Req]) -> None:
         """按 MLFQ 层级排序，同层内部保持 FIFO。"""
-        waiting_queue.sort(
-            key=lambda r: (
-                getattr(r, "mlfq_level", MLFQ_NUM_LEVELS - 1),
-                getattr(r, "mlfq_last_queued_time", 0.0),
-                r.time_stats.wait_queue_entry_time,
-                str(r.rid),
-            )
-        )
+        waiting_queue.sort(key=lambda r: mlfq_sort_key(r, self.mlfq_config))
+
+    def _assign_mlfq_levels_from_current_work(self, waiting_queue: List[Req]) -> None:
+        server_args = get_global_server_args()
+        chunked_prefill_size = server_args.chunked_prefill_size
+        for req in waiting_queue:
+            if req.retracted_stain or getattr(req, "mlfq_classified_for_queue", False):
+                continue
+            full_len = len(req.origin_input_ids) + len(req.output_ids)
+            matched = getattr(req, "num_matched_prefix_tokens", 0)
+            work_tokens = max(1, full_len - matched)
+            if chunked_prefill_size is not None and chunked_prefill_size > 0:
+                work_tokens = min(work_tokens, chunked_prefill_size)
+            req.assign_mlfq_level_for_next_iter(work_tokens, self.mlfq_config)
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:

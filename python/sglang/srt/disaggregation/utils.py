@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import random
+import socket
+import hashlib
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -30,6 +32,23 @@ if TYPE_CHECKING:
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+PREFILL_TIMING_SCHEMA_VERSION = 2
+
+
+def get_clock_domain_id() -> str:
+    boot_id = "unknown_boot"
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "r", encoding="utf-8") as f:
+            boot_id = f.read().strip() or boot_id
+    except OSError:
+        pass
+    return f"{socket.gethostname()}:{boot_id}"
+
+
+def get_clock_domain_hash() -> int:
+    digest = hashlib.sha256(get_clock_domain_id().encode("utf-8")).digest()
+    # Keep the value exactly representable in float64 metadata buffers.
+    return int.from_bytes(digest[:6], "big")
 
 
 class DisaggregationMode(Enum):
@@ -196,6 +215,7 @@ class ReqToMetadataIdxAllocator:
 
 class MetadataBuffers:
     prefill_timing_fields = (
+        "schema_version",
         "prefill_scheduler_enqueue_time",
         "prefill_bootstrap_queue_entry_time",
         "prefill_wait_queue_entry_time",
@@ -203,14 +223,18 @@ class MetadataBuffers:
         "prefill_finished_time",
         "prefill_transfer_queue_entry_time",
         "prefill_kv_transfer_finish_time",
-        "prefill_execution_time",
+        "prefill_batch_wall_time_attributed",
         "prefill_kv_transfer_time",
-        "prefill_actual_execution_time",
+        "prefill_attributed_batch_wall_time",
+        "prefill_execution_time_deprecated",
+        "prefill_actual_execution_time_deprecated",
         "prefill_mlfq_level",
         "prefill_mlfq_tokens_in_level",
         "prefill_prompt_len",
         "prefill_output_len",
+        "prefill_clock_domain_hash",
     )
+    prefill_timing_width = len(prefill_timing_fields)
 
     def __init__(
         self,
@@ -273,7 +297,7 @@ class MetadataBuffers:
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
             self.prefill_timing_info = torch.zeros(
-                (size, 16), dtype=torch.float64, device=device
+                (size, self.prefill_timing_width), dtype=torch.float64, device=device
             )
 
     def get_buf_infos(self):
@@ -387,6 +411,7 @@ class MetadataBuffers:
 
         ts = req.time_stats
         prefill_timing_values = (
+            PREFILL_TIMING_SCHEMA_VERSION,
             req.scheduler_enqueue_time,
             ts.prefill_bootstrap_queue_entry_time,
             ts.wait_queue_entry_time,
@@ -394,14 +419,18 @@ class MetadataBuffers:
             ts.prefill_finished_time,
             ts.prefill_transfer_queue_entry_time,
             ts.prefill_kv_transfer_finish_time,
-            req.prefill_execution_time,
+            req.prefill_batch_wall_time_attributed,
             req.kv_transfer_time,
+            req.attributed_batch_wall_time,
+            req.prefill_execution_time,
             req.actual_execution_time,
             req.mlfq_level,
             req.mlfq_tokens_in_level,
             len(req.origin_input_ids),
             len(req.output_ids),
+            get_clock_domain_hash(),
         )
+        assert len(prefill_timing_values) == self.prefill_timing_width
         timing_info = self.prefill_timing_info[req.metadata_buffer_index]
         timing_info.zero_()
         for i, value in enumerate(prefill_timing_values):

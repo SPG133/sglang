@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Request Timing Visualization</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18202a;
+      --muted: #667085;
+      --line: #d9dee8;
+      --panel: #f7f8fb;
+      --p-queue: #4c78a8;
+      --p-exec: #59a14f;
+      --transfer: #f28e2b;
+      --d-queue: #b07aa1;
+      --d-exec: #e15759;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: #fff;
+      line-height: 1.5;
+    }
+
+    main {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 32px 24px 48px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 26px;
+      font-weight: 700;
+    }
+
+    .sub {
+      margin: 0 0 24px;
+      color: var(--muted);
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 20px;
+      margin: 18px 0;
+      background: #fff;
+    }
+
+    .timeline {
+      position: relative;
+      padding: 32px 0 8px 128px;
+      border-radius: 8px;
+      background:
+        linear-gradient(to right, rgba(24, 32, 42, .08) 1px, transparent 1px) 0 0 / 10% 100%,
+        var(--panel);
+      overflow-x: auto;
+    }
+
+    .axis {
+      position: absolute;
+      left: 128px;
+      right: 0;
+      top: 8px;
+      height: 18px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .tick {
+      position: absolute;
+      transform: translateX(-50%);
+      white-space: nowrap;
+    }
+
+    .lane {
+      position: relative;
+      min-width: 880px;
+      height: 58px;
+      margin: 16px 0;
+    }
+
+    .lane-label {
+      position: absolute;
+      left: -118px;
+      top: 13px;
+      width: 104px;
+      font-weight: 700;
+      color: #344054;
+      text-align: right;
+    }
+
+    .bar {
+      position: absolute;
+      top: 8px;
+      height: 28px;
+      min-width: 2px;
+      border-radius: 5px;
+      color: #fff;
+      font-size: 12px;
+      font-weight: 650;
+      display: flex;
+      align-items: center;
+      padding: 0 8px;
+      overflow: visible;
+      white-space: nowrap;
+      box-shadow: inset 0 -1px 0 rgba(0, 0, 0, .16);
+    }
+
+    .thin {
+      top: 42px;
+      height: 8px;
+      padding: 0;
+      border-radius: 99px;
+    }
+
+    .label-out {
+      position: absolute;
+      top: -18px;
+      left: 0;
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+
+    .p-queue { background: var(--p-queue); }
+    .p-exec { background: var(--p-exec); }
+    .transfer { background: var(--transfer); }
+    .d-queue { background: var(--d-queue); }
+    .d-exec { background: var(--d-exec); }
+
+    .metrics {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+
+    .metrics th,
+    .metrics td {
+      border-bottom: 1px solid var(--line);
+      padding: 9px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .metrics th {
+      color: #344054;
+      background: #f6f7fa;
+      font-weight: 700;
+    }
+
+    code {
+      font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: .92em;
+      background: #f2f4f7;
+      border-radius: 4px;
+      padding: 1px 4px;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 18px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .swatch {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+      margin-right: 6px;
+      vertical-align: -1px;
+    }
+
+    .note {
+      color: var(--muted);
+      margin: 10px 0 0;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>PD 分离 Request Timing 可视化</h1>
+    <p class="sub">以 D 端入队时间 <code>1977713.623054711</code> 作为 0ms，总观测窗口约 <code>2097.009ms</code>。</p>
+
+    <section class="card">
+      <h2>PD 分离时间轴</h2>
+      <div class="timeline" aria-label="PD request timing timeline">
+        <div class="axis">
+          <span class="tick" style="left:0%">0ms</span>
+          <span class="tick" style="left:25%">524ms</span>
+          <span class="tick" style="left:50%">1049ms</span>
+          <span class="tick" style="left:75%">1573ms</span>
+          <span class="tick" style="left:100%">2097ms</span>
+        </div>
+
+        <div class="lane">
+          <div class="lane-label">P 端</div>
+          <div class="bar p-queue" style="left:1.885%; width:22.736%;">
+            排队 476.8ms
+          </div>
+          <div class="bar p-exec" style="left:24.622%; width:4.430%;">
+            prefill wall 92.9ms
+            <span class="label-out">GPU 执行 14.6ms</span>
+          </div>
+          <div class="bar transfer thin" style="left:29.053%; width:0.413%;">
+            <span class="label-out">P->D 8.7ms</span>
+          </div>
+        </div>
+
+        <div class="lane">
+          <div class="lane-label">D 端</div>
+          <div class="bar d-queue" style="left:0%; width:29.471%;">
+            等待/排队 618.0ms
+          </div>
+          <div class="bar d-exec" style="left:29.471%; width:70.529%;">
+            decode wall 1479.0ms
+            <span class="label-out">GPU 执行 467.3ms</span>
+          </div>
+          <div class="bar d-queue thin" style="left:29.466%; width:0.005%;">
+            <span class="label-out">ready 后等待 0.098ms</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="legend">
+        <span><span class="swatch" style="background:var(--p-queue)"></span>P 端排队</span>
+        <span><span class="swatch" style="background:var(--p-exec)"></span>P 端 prefill</span>
+        <span><span class="swatch" style="background:var(--transfer)"></span>P/D transfer 观察值</span>
+        <span><span class="swatch" style="background:var(--d-queue)"></span>D 端等待/排队</span>
+        <span><span class="swatch" style="background:var(--d-exec)"></span>D 端 decode</span>
+      </div>
+      <p class="note">图中的 wall 表示从阶段开始到阶段结束的墙钟时间；GPU 执行时间使用你的执行计时字段，二者不一定相等。</p>
+    </section>
+
+    <section class="card">
+      <h2>六个核心指标</h2>
+      <table class="metrics">
+        <thead>
+          <tr>
+            <th>视角</th>
+            <th>指标</th>
+            <th>字段</th>
+            <th>值</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>P 端</td>
+            <td>入队时间</td>
+            <td><code>pd_prefill_queue_entry_time</code></td>
+            <td><code>1977713.662589585</code></td>
+          </tr>
+          <tr>
+            <td>P 端</td>
+            <td>出队/开始 prefill</td>
+            <td><code>pd_prefill_forward_entry_time</code></td>
+            <td><code>1977714.13937408</code></td>
+          </tr>
+          <tr>
+            <td>P 端</td>
+            <td>排队耗时</td>
+            <td><code>pd_prefill_queue_duration</code></td>
+            <td><code>0.476784495s</code></td>
+          </tr>
+          <tr>
+            <td>P 端</td>
+            <td>prefill 执行</td>
+            <td><code>pd_prefill_execution_time</code></td>
+            <td><code>0.014607495s</code></td>
+          </tr>
+          <tr>
+            <td>D 端</td>
+            <td>入队时间</td>
+            <td><code>queue_entry_time</code></td>
+            <td><code>1977713.623054711</code></td>
+          </tr>
+          <tr>
+            <td>D 端</td>
+            <td>出队/开始 decode</td>
+            <td><code>queue_dequeue_time</code></td>
+            <td><code>1977714.241067145</code></td>
+          </tr>
+          <tr>
+            <td>D 端</td>
+            <td>排队/等待耗时</td>
+            <td><code>queue_duration</code></td>
+            <td><code>0.618012434s</code></td>
+          </tr>
+          <tr>
+            <td>D 端</td>
+            <td>decode 执行</td>
+            <td><code>decode_execution_time</code></td>
+            <td><code>0.467296517s</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Normal D-only 视角</h2>
+      <p>如果 normal 模式只按 D 端口径比较，就保留下面四个指标即可：</p>
+      <table class="metrics">
+        <thead>
+          <tr>
+            <th>指标</th>
+            <th>PD 中对应字段</th>
+            <th>当前值</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>D 入队</td>
+            <td><code>queue_entry_time</code></td>
+            <td><code>1977713.623054711</code></td>
+          </tr>
+          <tr>
+            <td>D 出队/开始执行</td>
+            <td><code>queue_dequeue_time</code></td>
+            <td><code>1977714.241067145</code></td>
+          </tr>
+          <tr>
+            <td>D 排队/等待</td>
+            <td><code>queue_duration</code></td>
+            <td><code>0.618012434s</code></td>
+          </tr>
+          <tr>
+            <td>D decode 执行</td>
+            <td><code>decode_execution_time</code></td>
+            <td><code>0.467296517s</code></td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="note">如果你给我 normal 模式的一条 JSONL 记录，我可以把它画到同一个坐标轴上做并排对比。</p>
+    </section>
+  </main>
+</body>
+</html>
