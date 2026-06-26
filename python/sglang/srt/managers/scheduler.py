@@ -324,6 +324,7 @@ class Scheduler(
         # Parse args
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
+        self.tp_rank = tp_rank
         self.requested_schedule_policy = getattr(
             server_args, "requested_schedule_policy", None
         ) or server_args.schedule_policy
