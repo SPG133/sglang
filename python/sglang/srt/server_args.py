@@ -431,9 +431,16 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
+    requested_schedule_policy: Optional[str] = None
+    effective_schedule_policy: Optional[str] = None
     mlfq_quanta: str = "1,2,4"
     mlfq_starvation_seconds: float = 1.0
     mlfq_prefill_thresholds: str = "32,256"
+    mlfq_decode_thresholds: str = "32,256"
+    mlfq_elastic_slowdown_multiplier: Optional[float] = None
+    mlfq_elastic_long_request_tokens: int = 256
+    mlfq_elastic_min_completed_requests: int = 16
+    mlfq_elastic_service_time_floor_seconds: float = 1e-6
     enable_priority_scheduling: bool = False
     disable_priority_preemption: bool = False
     default_priority_value: Optional[int] = None
@@ -923,6 +930,7 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+        self._handle_effective_schedule_policy()
 
         # Validate --prefill-only-disable-kv-cache args early (before dummy-model
         # short-circuit). The backend check is run later after backends settle.
@@ -1086,6 +1094,21 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+    def _handle_effective_schedule_policy(self):
+        self.requested_schedule_policy = self.schedule_policy
+        if (
+            self.requested_schedule_policy == "mlfq"
+            and self.disaggregation_mode != "decode"
+        ):
+            self.effective_schedule_policy = "fcfs"
+            logger.warning(
+                "--schedule-policy mlfq is only effective on PD decode workers; "
+                "disaggregation_mode=%s falls back to effective_schedule_policy=fcfs.",
+                self.disaggregation_mode,
+            )
+        else:
+            self.effective_schedule_policy = self.requested_schedule_policy
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
@@ -4860,8 +4883,10 @@ class ServerArgs:
             ],
             help=(
                 "The scheduling policy of the requests. The 'mlfq' policy is "
-                "MLFQ admission scheduling: it orders queued admission work and "
-                "does not preempt requests already in a running decode batch."
+                "PD decode-only MLFQ admission scheduling: it orders queued "
+                "decode admission work and does not preempt requests already in "
+                "a running decode batch. In non-PD and PD prefill modes, mlfq "
+                "falls back to effective_schedule_policy=fcfs."
             ),
         )
         parser.add_argument(
@@ -4890,6 +4915,50 @@ class ServerArgs:
                 "Comma-separated positive, strictly increasing prefill work "
                 "thresholds for initial MLFQ levels, e.g. '32,256'. The count "
                 "must be one fewer than --mlfq-quanta."
+            ),
+        )
+        parser.add_argument(
+            "--mlfq-decode-thresholds",
+            type=str,
+            default=ServerArgs.mlfq_decode_thresholds,
+            help=(
+                "Comma-separated positive, strictly increasing remaining-output-token "
+                "thresholds for initial D-side MLFQ levels, e.g. '32,256'. "
+                "The count must be one fewer than --mlfq-quanta."
+            ),
+        )
+        parser.add_argument(
+            "--mlfq-elastic-slowdown-multiplier",
+            type=float,
+            default=ServerArgs.mlfq_elastic_slowdown_multiplier,
+            help=(
+                "Optional D-side MLFQ elastic promotion multiplier. Disabled when "
+                "unset. When enabled, long requests whose predicted slowdown reaches "
+                "max(1, completed_slowdown_mean) * multiplier are promoted to level 0."
+            ),
+        )
+        parser.add_argument(
+            "--mlfq-elastic-long-request-tokens",
+            type=int,
+            default=ServerArgs.mlfq_elastic_long_request_tokens,
+            help="Minimum remaining output tokens for D-side elastic MLFQ promotion.",
+        )
+        parser.add_argument(
+            "--mlfq-elastic-min-completed-requests",
+            type=int,
+            default=ServerArgs.mlfq_elastic_min_completed_requests,
+            help=(
+                "Minimum locally completed D-side requests before elastic MLFQ "
+                "promotion can trigger."
+            ),
+        )
+        parser.add_argument(
+            "--mlfq-elastic-service-time-floor-seconds",
+            type=float,
+            default=ServerArgs.mlfq_elastic_service_time_floor_seconds,
+            help=(
+                "Positive service-time floor for D-side slowdown calculations to "
+                "avoid division by zero or tiny denominators."
             ),
         )
         parser.add_argument(
@@ -7579,10 +7648,14 @@ class ServerArgs:
         ), "--request-io-dedup-capacity must be positive."
 
         if self.enable_priority_scheduling:
-            assert self.schedule_policy in [
+            assert (self.effective_schedule_policy or self.schedule_policy) in [
                 "fcfs",
                 "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+            ], (
+                "To use priority scheduling, effective_schedule_policy must be "
+                "'fcfs' or 'lof'. "
+                f"'{self.effective_schedule_policy or self.schedule_policy}' is not supported."
+            )
             if self.default_priority_value is None:
                 logger.warning(
                     "--default-priority-value is not set while --enable-priority-scheduling is enabled. "

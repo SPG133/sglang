@@ -170,7 +170,13 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sglang.srt.managers.mlfq import MLFQConfig
+from sglang.srt.managers.mlfq import (
+    DecodeMLFQStats,
+    MLFQConfig,
+    assign_initial_decode_mlfq_level,
+    maybe_elastic_promote,
+    promote_starved_requests,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -318,7 +324,13 @@ class Scheduler(
         # Parse args
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
-        self.schedule_policy = server_args.schedule_policy
+        self.requested_schedule_policy = getattr(
+            server_args, "requested_schedule_policy", None
+        ) or server_args.schedule_policy
+        self.effective_schedule_policy = getattr(
+            server_args, "effective_schedule_policy", None
+        ) or self.requested_schedule_policy
+        self.schedule_policy = self.effective_schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
             server_args.abort_on_priority_when_disabled
@@ -973,13 +985,27 @@ class Scheduler(
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
         self.mlfq_config = MLFQConfig.from_server_args(self.server_args)
+        self.decode_mlfq_stats = DecodeMLFQStats()
         self.policy = SchedulePolicy(
-            self.schedule_policy,
+            self.effective_schedule_policy,
             self.tree_cache,
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
             self.mlfq_config,
+        )
+        logger.info(
+            "Scheduler policy requested=%s effective=%s is_decode_mlfq_enabled=%s "
+            "mlfq_elastic_multiplier=%s mlfq_elastic_long_request_tokens=%s "
+            "mlfq_elastic_min_completed_requests=%s "
+            "mlfq_elastic_service_time_floor_seconds=%s",
+            self.requested_schedule_policy,
+            self.effective_schedule_policy,
+            self.is_decode_mlfq_enabled(),
+            self.mlfq_config.elastic_slowdown_multiplier,
+            self.mlfq_config.elastic_long_request_tokens,
+            self.mlfq_config.elastic_min_completed_requests,
+            self.mlfq_config.elastic_service_time_floor_seconds,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: int = 0
@@ -2187,7 +2213,7 @@ class Scheduler(
             return
         if not req.scheduler_enqueue_recorded:
             req.record_scheduler_enqueue()
-        if self._is_mlfq_enabled():
+        if self.is_decode_mlfq_enabled():
             self._prepare_mlfq_enqueue(req, is_retracted=is_retracted)
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
@@ -2210,19 +2236,47 @@ class Scheduler(
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
-    def _is_mlfq_enabled(self) -> bool:
+    def is_decode_mlfq_enabled(self) -> bool:
         return (
-            self.schedule_policy == "mlfq"
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
+            self.effective_schedule_policy == "mlfq"
+            and self.disaggregation_mode == DisaggregationMode.DECODE
         )
+
+    def _is_mlfq_enabled(self) -> bool:
+        return self.is_decode_mlfq_enabled()
 
     def _prepare_mlfq_enqueue(self, req: Req, is_retracted: bool = False):
         # Skip-join 只用于新到达请求；retract 回来的请求保留当前队列等级，
         # 否则每次 OOM 后都会被重置到最高队列，反馈队列就失效了。
-        if not is_retracted:
-            req.mlfq_level = self.mlfq_config.num_levels - 1
-            req.mlfq_tokens_in_level = 0
+        if not getattr(req, "mlfq_decode_initialized", False):
+            assign_initial_decode_mlfq_level(req, self.mlfq_config)
         req.record_mlfq_enqueue()
+
+    def _decode_mlfq_queue_entry_time(self, req: Req) -> float:
+        ts = req.time_stats
+        return (
+            ts.decode_prealloc_queue_entry_time
+            or ts.decode_transfer_queue_entry_time
+            or ts.wait_queue_entry_time
+            or req.scheduler_enqueue_time
+        )
+
+    def _prepare_decode_mlfq_queue(self, reqs, timestamp: Optional[float] = None):
+        if not self.is_decode_mlfq_enabled():
+            return
+        now = timestamp if timestamp is not None else time.monotonic()
+        for req in reqs:
+            if not getattr(req, "mlfq_decode_initialized", False):
+                assign_initial_decode_mlfq_level(req, self.mlfq_config)
+        promote_starved_requests(reqs, self.mlfq_config, timestamp=now)
+        for req in reqs:
+            maybe_elastic_promote(
+                req,
+                now=now,
+                d_queue_entry_time=self._decode_mlfq_queue_entry_time(req),
+                stats=self.decode_mlfq_stats,
+                config=self.mlfq_config,
+            )
 
     def _record_batch_execution_start(self, batch: ScheduleBatch):
         now = time.monotonic()
@@ -2399,7 +2453,10 @@ class Scheduler(
             "scheduler_rank": self.tp_rank,
             "scheduler_role": self.disaggregation_mode.value,
             "disaggregation_mode": self.disaggregation_mode.value,
-            "schedule_policy": self.schedule_policy,
+            "requested_schedule_policy": self.requested_schedule_policy,
+            "effective_schedule_policy": self.effective_schedule_policy,
+            "schedule_policy": self.effective_schedule_policy,
+            "is_decode_mlfq_enabled": self.is_decode_mlfq_enabled(),
             "rid": req.rid,
             "scheduler_enqueue_time": req.scheduler_enqueue_time,
             "release_time": req.release_time,
@@ -2418,6 +2475,16 @@ class Scheduler(
             "kv_transfer_time": req.kv_transfer_time,
             "mlfq_level": req.mlfq_level,
             "mlfq_tokens_in_level": req.mlfq_tokens_in_level,
+            "decode_slowdown": req.decode_slowdown,
+            "global_completed_slowdown_mean": (
+                self.decode_mlfq_stats.completed_slowdown_mean
+            ),
+            "completed_slowdown_count": self.decode_mlfq_stats.completed_count,
+            "predicted_slowdown_at_last_queue_check": (
+                req.predicted_slowdown_at_last_queue_check
+            ),
+            "elastic_effective_threshold": req.elastic_effective_threshold,
+            "elastic_promoted": req.mlfq_elastic_promoted,
             "prompt_len": len(req.origin_input_ids),
             "output_len": len(req.output_ids),
             "finished_reason": (
@@ -2472,7 +2539,9 @@ class Scheduler(
             "scheduler_rank": self.tp_rank,
             "scheduler_role": self.disaggregation_mode.value,
             "disaggregation_mode": self.disaggregation_mode.value,
-            "schedule_policy": self.schedule_policy,
+            "requested_schedule_policy": self.requested_schedule_policy,
+            "effective_schedule_policy": self.effective_schedule_policy,
+            "schedule_policy": self.effective_schedule_policy,
             "rid": req.rid,
             "input_ids": input_ids,
             "output_ids": output_ids,
@@ -2513,8 +2582,31 @@ class Scheduler(
         for req in batch.reqs:
             if req.finished():
                 req.finalize_scheduler_timing(now)
+                self._record_decode_mlfq_completed(req)
                 self._dump_request_timing_record(req)
                 self._dump_request_io_record(req)
+
+    def _record_decode_mlfq_completed(self, req: Req):
+        if not self.is_decode_mlfq_enabled():
+            return
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            return
+        d_queue_entry_time = self._decode_mlfq_queue_entry_time(req)
+        if d_queue_entry_time <= 0.0 or req.release_time <= 0.0:
+            return
+        d_flow_time = max(0.0, req.release_time - d_queue_entry_time)
+        d_service_time = (
+            req.decode_batch_wall_time_attributed
+            or req.decode_execution_time
+            or 0.0
+        )
+        slowdown = self.decode_mlfq_stats.record_completed_request(
+            d_flow_time=d_flow_time,
+            d_service_time=d_service_time,
+            output_tokens=len(req.output_ids),
+            epsilon=self.mlfq_config.service_time_floor(),
+        )
+        req.decode_slowdown = slowdown
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -3019,16 +3111,6 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
-            if (
-                self._is_mlfq_enabled()
-                and len(adder.can_run_list) > 0
-                and req is adder.can_run_list[-1]
-                and not req.retracted_stain
-            ):
-                req.assign_mlfq_level_for_next_iter(
-                    req.extend_input_len, self.mlfq_config
-                )
-
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 
@@ -3065,7 +3147,7 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
-        if self._is_mlfq_enabled():
+        if self.is_decode_mlfq_enabled():
             now = time.monotonic()
             for req in can_run_list:
                 req.record_mlfq_dequeue(now)
@@ -3266,7 +3348,7 @@ class Scheduler(
 
         # Update batch tensors
         batch.prepare_for_decode()
-        if self._is_mlfq_enabled():
+        if self.is_decode_mlfq_enabled():
             for req in batch.reqs:
                 req.update_mlfq_after_schedule(1, self.mlfq_config)
         return batch

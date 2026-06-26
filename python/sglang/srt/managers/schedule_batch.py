@@ -983,6 +983,11 @@ class Req(ReqDllmMixin):
         self.mlfq_is_queued = False
         self.mlfq_last_wait_duration = 0.0
         self.mlfq_classified_for_queue = False
+        self.mlfq_decode_initialized = False
+        self.mlfq_elastic_promoted = False
+        self.predicted_slowdown_at_last_queue_check = 0.0
+        self.elastic_effective_threshold = 0.0
+        self.decode_slowdown = None
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -1033,6 +1038,11 @@ class Req(ReqDllmMixin):
         self.mlfq_is_queued = False
         self.mlfq_last_wait_duration = 0.0
         self.mlfq_classified_for_queue = False
+        self.mlfq_decode_initialized = False
+        self.mlfq_elastic_promoted = False
+        self.predicted_slowdown_at_last_queue_check = 0.0
+        self.elastic_effective_threshold = 0.0
+        self.decode_slowdown = None
 
     def record_execution_start(
         self, is_decode: bool, timestamp: Optional[float] = None

@@ -546,8 +546,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return mlfq_sort_key(req, scheduler.mlfq_config)
 
     def _sort_decode_queues_for_mlfq(self):
-        if self.scheduler.schedule_policy != "mlfq":
+        if not self.scheduler.is_decode_mlfq_enabled():
             return
+        self.scheduler._prepare_decode_mlfq_queue(
+            [decode_req.req for decode_req in self.queue]
+        )
+        self.scheduler._prepare_decode_mlfq_queue(self.retracted_queue)
         # PD decode 端有自己的 prealloc/retracted 队列；这里按 MLFQ 优先级重排，
         # 让 --schedule-policy mlfq 不只影响普通 waiting_queue。
         self.queue.sort(
@@ -1528,76 +1532,66 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
         if output_prefill_timing_info.numel() != self.metadata_buffers.prefill_timing_width:
-            error_msg = (
+            logger.warning(
                 f"Prefill metadata field count mismatch for request {decode_req.req.rid}: "
                 f"expected {self.metadata_buffers.prefill_timing_width}, "
-                f"got {output_prefill_timing_info.numel()}"
+                f"got {output_prefill_timing_info.numel()}; "
+                "continuing with local D-side MLFQ initialization."
             )
-            logger.error(error_msg)
-            prepare_abort(
-                decode_req.req,
-                error_msg,
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-            decode_req.kv_receiver.clear()
-            decode_req.kv_receiver = None
-            return
+            decode_req.req.pd_prefill_timing_info = {}
+            if (
+                self.scheduler.is_decode_mlfq_enabled()
+                and not getattr(decode_req.req, "mlfq_decode_initialized", False)
+            ):
+                self.scheduler._prepare_mlfq_enqueue(decode_req.req)
+            output_prefill_timing_info = None
 
-        prefill_timing_values = output_prefill_timing_info.cpu().tolist()
-        schema_version = int(prefill_timing_values[0])
-        if schema_version != PREFILL_TIMING_SCHEMA_VERSION:
-            if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
-                logger.warning(
-                    "Prefill metadata unavailable for fake PD transfer; "
-                    "falling back to lowest MLFQ priority for rid=%s",
+        if output_prefill_timing_info is not None:
+            prefill_timing_values = output_prefill_timing_info.cpu().tolist()
+            schema_version = int(prefill_timing_values[0])
+        else:
+            prefill_timing_values = []
+            schema_version = -1
+
+        if (
+            output_prefill_timing_info is not None
+            and schema_version != PREFILL_TIMING_SCHEMA_VERSION
+        ):
+            logger.warning(
+                "Prefill timing metadata schema mismatch for rid=%s: "
+                "expected %s, got %s; continuing with local D-side MLFQ initialization.",
+                decode_req.req.rid,
+                PREFILL_TIMING_SCHEMA_VERSION,
+                schema_version,
+            )
+            decode_req.req.pd_prefill_timing_info = {}
+        else:
+            decode_req.req.pd_prefill_timing_info = {
+                name: float(value)
+                for name, value in zip(
+                    self.metadata_buffers.prefill_timing_fields,
+                    prefill_timing_values,
+                )
+            }
+            if (
+                self.scheduler.is_decode_mlfq_enabled()
+                and int(
+                    decode_req.req.pd_prefill_timing_info.get(
+                        "prefill_mlfq_state_valid", 0
+                    )
+                )
+            ):
+                logger.info(
+                    "Ignoring P-side MLFQ metadata for rid=%s; "
+                    "using local D-side MLFQ state.",
                     decode_req.req.rid,
                 )
-                decode_req.req.mlfq_level = self.scheduler.mlfq_config.num_levels - 1
-                decode_req.req.mlfq_tokens_in_level = 0
-                decode_req.req.pd_prefill_timing_info = {}
-            else:
-                error_msg = (
-                    f"Prefill metadata schema mismatch for request {decode_req.req.rid}: "
-                    f"expected {PREFILL_TIMING_SCHEMA_VERSION}, got {schema_version}"
-                )
-                logger.error(error_msg)
-                prepare_abort(
-                    decode_req.req,
-                    error_msg,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-                decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
-                return
-        decode_req.req.pd_prefill_timing_info = {
-            name: float(value)
-            for name, value in zip(
-                self.metadata_buffers.prefill_timing_fields,
-                prefill_timing_values,
-            )
-        }
+
         if (
-            schema_version == PREFILL_TIMING_SCHEMA_VERSION
-            and int(
-                decode_req.req.pd_prefill_timing_info.get(
-                    "prefill_mlfq_state_valid", 0
-                )
-            )
+            self.scheduler.is_decode_mlfq_enabled()
+            and not getattr(decode_req.req, "mlfq_decode_initialized", False)
         ):
-            decode_req.req.mlfq_level = int(
-                decode_req.req.pd_prefill_timing_info["prefill_mlfq_level"]
-            )
-            decode_req.req.mlfq_tokens_in_level = int(
-                decode_req.req.pd_prefill_timing_info[
-                    "prefill_mlfq_tokens_in_level"
-                ]
-            )
-        elif self.scheduler.schedule_policy == "mlfq":
-            logger.info(
-                "Prefill metadata has no valid MLFQ state for rid=%s; "
-                "using decode-side MLFQ fallback state.",
-                decode_req.req.rid,
-            )
+            self.scheduler._prepare_mlfq_enqueue(decode_req.req)
 
         # Case 3: Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
@@ -1917,7 +1911,10 @@ class SchedulerDisaggregationDecodeMixin:
         if len(self.waiting_queue) == 0:
             return None
 
-        if self.enable_priority_scheduling or self._is_mlfq_enabled():
+        if self.is_decode_mlfq_enabled():
+            self._prepare_decode_mlfq_queue(self.waiting_queue)
+
+        if self.enable_priority_scheduling or self.is_decode_mlfq_enabled():
             self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         curr_batch_size = self.running_batch.batch_size()
@@ -1956,7 +1953,7 @@ class SchedulerDisaggregationDecodeMixin:
         if len(can_run_list) == 0:
             return None
 
-        if self._is_mlfq_enabled():
+        if self.is_decode_mlfq_enabled():
             now = time.monotonic()
             for req in can_run_list:
                 req.record_mlfq_dequeue(now)
