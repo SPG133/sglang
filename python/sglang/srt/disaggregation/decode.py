@@ -1957,7 +1957,7 @@ class SchedulerDisaggregationDecodeMixin:
             now = time.monotonic()
             for req in can_run_list:
                 req.record_mlfq_dequeue(now)
-                req.update_mlfq_after_schedule(1, self.mlfq_config)
+                req.update_decode_mlfq_after_schedule(1, self.mlfq_config)
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 

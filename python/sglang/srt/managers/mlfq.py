@@ -6,11 +6,11 @@ import time
 from typing import Any, Iterable, Optional, Sequence, Tuple
 
 
-DEFAULT_MLFQ_QUANTA = (1, 2, 4)
-DEFAULT_MLFQ_PREFILL_THRESHOLDS = (32, 256)
-DEFAULT_MLFQ_DECODE_THRESHOLDS = (32, 256)
-DEFAULT_MLFQ_STARVATION_SECONDS = 3.0
-DEFAULT_MLFQ_ELASTIC_LONG_REQUEST_TOKENS = 256
+DEFAULT_MLFQ_QUANTA = (8, 16, 32)
+DEFAULT_MLFQ_PREFILL_THRESHOLDS = (64, 512)
+DEFAULT_MLFQ_DECODE_THRESHOLDS = (64, 256)
+DEFAULT_MLFQ_STARVATION_SECONDS = 0.2
+DEFAULT_MLFQ_ELASTIC_LONG_REQUEST_TOKENS = 32
 DEFAULT_MLFQ_ELASTIC_MIN_COMPLETED_REQUESTS = 16
 DEFAULT_MLFQ_ELASTIC_SERVICE_TIME_FLOOR_SECONDS = 1e-6
 DEFAULT_MLFQ_DECODE_SECONDS_PER_TOKEN_EWMA_ALPHA = 0.1
@@ -374,6 +374,17 @@ def update_mlfq_after_service(
         getattr(req, "mlfq_level", config.num_levels - 1),
         getattr(req, "mlfq_tokens_in_level", 0),
     )
+
+
+def update_decode_mlfq_after_service(
+    req: Any, scheduled_tokens: int, config: MLFQConfig
+) -> None:
+    update_mlfq_after_service(req, scheduled_tokens, config)
+
+    remaining_level = config.level_for_decode_work(config.remaining_decode_tokens(req))
+    if remaining_level < getattr(req, "mlfq_level", config.num_levels - 1):
+        req.mlfq_level = remaining_level
+        req.mlfq_tokens_in_level = 0
 
 
 def record_mlfq_enqueue(req: Any, timestamp: float | None = None) -> None:

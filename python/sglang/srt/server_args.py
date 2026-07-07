@@ -433,12 +433,12 @@ class ServerArgs:
     schedule_policy: str = "fcfs"
     requested_schedule_policy: Optional[str] = None
     effective_schedule_policy: Optional[str] = None
-    mlfq_quanta: str = "1,2,4"
-    mlfq_starvation_seconds: float = 3.0
-    mlfq_prefill_thresholds: str = "32,256"
-    mlfq_decode_thresholds: str = "32,256"
+    mlfq_quanta: str = "8,16,32"
+    mlfq_starvation_seconds: float = 0.2
+    mlfq_prefill_thresholds: str = "64,512"
+    mlfq_decode_thresholds: str = "64,256"
     mlfq_elastic_slowdown_multiplier: Optional[float] = None
-    mlfq_elastic_long_request_tokens: int = 256
+    mlfq_elastic_long_request_tokens: int = 32
     mlfq_elastic_min_completed_requests: int = 16
     mlfq_elastic_service_time_floor_seconds: float = 1e-6
     enable_priority_scheduling: bool = False
@@ -4895,7 +4895,7 @@ class ServerArgs:
             default=ServerArgs.mlfq_quanta,
             help=(
                 "Comma-separated positive integer quanta for MLFQ admission "
-                "levels, e.g. '1,2,4'. Used only with --schedule-policy mlfq."
+                "levels, e.g. '8,16,32'. Used only with --schedule-policy mlfq."
             ),
         )
         parser.add_argument(
@@ -4913,7 +4913,7 @@ class ServerArgs:
             default=ServerArgs.mlfq_prefill_thresholds,
             help=(
                 "Comma-separated positive, strictly increasing prefill work "
-                "thresholds for initial MLFQ levels, e.g. '32,256'. The count "
+                "thresholds for initial MLFQ levels, e.g. '64,512'. The count "
                 "must be one fewer than --mlfq-quanta."
             ),
         )
@@ -4923,7 +4923,7 @@ class ServerArgs:
             default=ServerArgs.mlfq_decode_thresholds,
             help=(
                 "Comma-separated positive, strictly increasing remaining-output-token "
-                "thresholds for initial D-side MLFQ levels, e.g. '32,256'. "
+                "thresholds for initial D-side MLFQ levels, e.g. '64,256'. "
                 "The count must be one fewer than --mlfq-quanta."
             ),
         )

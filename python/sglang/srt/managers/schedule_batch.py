@@ -73,7 +73,10 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.managers.mlfq import MLFQConfig
+from sglang.srt.managers.mlfq import (
+    MLFQConfig,
+    update_decode_mlfq_after_service,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -988,6 +991,8 @@ class Req(ReqDllmMixin):
         self.predicted_slowdown_at_last_queue_check = 0.0
         self.elastic_effective_threshold = 0.0
         self.decode_slowdown = None
+        self.decode_scheduler_slowdown = None
+        self.decode_admission_slowdown = None
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -1043,6 +1048,8 @@ class Req(ReqDllmMixin):
         self.predicted_slowdown_at_last_queue_check = 0.0
         self.elastic_effective_threshold = 0.0
         self.decode_slowdown = None
+        self.decode_scheduler_slowdown = None
+        self.decode_admission_slowdown = None
 
     def record_execution_start(
         self, is_decode: bool, timestamp: Optional[float] = None
@@ -1150,6 +1157,14 @@ class Req(ReqDllmMixin):
         self.mlfq_tokens_in_level += max(1, scheduled_tokens)
         self.mlfq_level, self.mlfq_tokens_in_level = config.next_level_after_service(
             self.mlfq_level, self.mlfq_tokens_in_level
+        )
+
+    def update_decode_mlfq_after_schedule(
+        self, scheduled_tokens: int, config: Optional[MLFQConfig] = None
+    ):
+        """Update D-side MLFQ while keeping nearly finished decodes near the front."""
+        update_decode_mlfq_after_service(
+            self, scheduled_tokens, config or MLFQConfig()
         )
 
     @property

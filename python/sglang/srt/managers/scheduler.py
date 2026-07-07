@@ -2262,9 +2262,9 @@ class Scheduler(
     def _decode_mlfq_queue_entry_time(self, req: Req) -> float:
         ts = req.time_stats
         return (
-            ts.decode_prealloc_queue_entry_time
+            ts.wait_queue_entry_time
             or ts.decode_transfer_queue_entry_time
-            or ts.wait_queue_entry_time
+            or ts.decode_prealloc_queue_entry_time
             or req.scheduler_enqueue_time
         )
 
@@ -2317,15 +2317,23 @@ class Scheduler(
                 or ts.wait_queue_entry_time
                 or req.scheduler_enqueue_time
             )
+            decode_admission_queue_entry_time = 0.0
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            queue_entry_time = (
+            decode_admission_queue_entry_time = (
                 ts.decode_prealloc_queue_entry_time
                 or ts.decode_transfer_queue_entry_time
                 or ts.wait_queue_entry_time
                 or req.scheduler_enqueue_time
             )
+            queue_entry_time = (
+                ts.wait_queue_entry_time
+                or ts.decode_transfer_queue_entry_time
+                or ts.decode_prealloc_queue_entry_time
+                or req.scheduler_enqueue_time
+            )
         else:
             queue_entry_time = ts.wait_queue_entry_time or req.scheduler_enqueue_time
+            decode_admission_queue_entry_time = 0.0
 
         queue_dequeue_time = ts.forward_entry_time
 
@@ -2339,6 +2347,13 @@ class Scheduler(
             "queue_duration": duration_between(queue_entry_time, queue_dequeue_time),
             "scheduler_total_time": duration_between(
                 queue_entry_time, req.release_time
+            ),
+            "decode_admission_queue_entry_time": decode_admission_queue_entry_time,
+            "decode_admission_queue_duration": duration_between(
+                decode_admission_queue_entry_time, queue_dequeue_time
+            ),
+            "decode_admission_total_time": duration_between(
+                decode_admission_queue_entry_time, req.release_time
             ),
             "wait_queue_entry_time": ts.wait_queue_entry_time,
             "forward_entry_time": ts.forward_entry_time,
@@ -2483,6 +2498,8 @@ class Scheduler(
             "mlfq_level": req.mlfq_level,
             "mlfq_tokens_in_level": req.mlfq_tokens_in_level,
             "decode_slowdown": req.decode_slowdown,
+            "decode_scheduler_slowdown": req.decode_scheduler_slowdown,
+            "decode_admission_slowdown": req.decode_admission_slowdown,
             "global_completed_slowdown_mean": (
                 self.decode_mlfq_stats.completed_slowdown_mean
             ),
@@ -2614,6 +2631,20 @@ class Scheduler(
             epsilon=self.mlfq_config.service_time_floor(),
         )
         req.decode_slowdown = slowdown
+        req.decode_scheduler_slowdown = slowdown
+
+        ts = req.time_stats
+        admission_entry_time = (
+            ts.decode_prealloc_queue_entry_time
+            or ts.decode_transfer_queue_entry_time
+            or ts.wait_queue_entry_time
+            or req.scheduler_enqueue_time
+        )
+        if admission_entry_time > 0.0 and req.release_time > 0.0:
+            admission_flow_time = max(0.0, req.release_time - admission_entry_time)
+            req.decode_admission_slowdown = admission_flow_time / max(
+                float(d_service_time), self.mlfq_config.service_time_floor()
+            )
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -3158,7 +3189,7 @@ class Scheduler(
             now = time.monotonic()
             for req in can_run_list:
                 req.record_mlfq_dequeue(now)
-                req.update_mlfq_after_schedule(
+                req.update_decode_mlfq_after_schedule(
                     req.extend_input_len, self.mlfq_config
                 )
 
@@ -3357,7 +3388,7 @@ class Scheduler(
         batch.prepare_for_decode()
         if self.is_decode_mlfq_enabled():
             for req in batch.reqs:
-                req.update_mlfq_after_schedule(1, self.mlfq_config)
+                req.update_decode_mlfq_after_schedule(1, self.mlfq_config)
         return batch
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):

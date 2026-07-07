@@ -11,6 +11,7 @@ from sglang.srt.managers.mlfq import (
     assign_initial_decode_mlfq_level,
     maybe_elastic_promote,
     mlfq_sort_key,
+    update_decode_mlfq_after_service,
 )
 from sglang.srt.server_args import ServerArgs
 
@@ -195,6 +196,24 @@ class TestMLFQDecodePolicy(unittest.TestCase):
 
         self.assertEqual(fake_req.mlfq_level, missing_req.mlfq_level)
         self.assertEqual(fake_req.mlfq_level, 0)
+
+    def test_decode_update_keeps_short_remaining_work_high_priority(self):
+        config = MLFQConfig(quanta=(1, 2, 4), prefill_thresholds=(64, 512))
+        req = make_req("short", max_new_tokens=3, output_len=1, level=0)
+
+        update_decode_mlfq_after_service(req, 1, config)
+
+        self.assertEqual(req.mlfq_level, 0)
+        self.assertEqual(req.mlfq_tokens_in_level, 0)
+
+    def test_decode_update_still_demotes_long_remaining_work(self):
+        config = MLFQConfig(quanta=(1, 2, 4), prefill_thresholds=(64, 512))
+        req = make_req("long", max_new_tokens=512, output_len=1, level=0)
+
+        update_decode_mlfq_after_service(req, 1, config)
+
+        self.assertEqual(req.mlfq_level, 1)
+        self.assertEqual(req.mlfq_tokens_in_level, 0)
 
     def test_completed_slowdown_mean(self):
         stats = DecodeMLFQStats()

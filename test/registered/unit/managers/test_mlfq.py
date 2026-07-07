@@ -31,9 +31,11 @@ def make_req(rid, *, level=0, enter=0.0, wait_entry=0.0):
 class TestMLFQConfig(unittest.TestCase):
     def test_default_config(self):
         config = MLFQConfig()
-        self.assertEqual(config.quanta, (1, 2, 4))
-        self.assertEqual(config.prefill_thresholds, (32, 256))
-        self.assertEqual(config.starvation_seconds, 1.0)
+        self.assertEqual(config.quanta, (8, 16, 32))
+        self.assertEqual(config.prefill_thresholds, (64, 512))
+        self.assertEqual(config.decode_thresholds, (64, 256))
+        self.assertEqual(config.starvation_seconds, 0.2)
+        self.assertEqual(config.elastic_long_request_tokens, 32)
 
     def test_parse_cli_values(self):
         config = MLFQConfig.from_cli_values(
