@@ -248,6 +248,8 @@ ctags/
 outputs/
 inputs/
 
+models/
+
 # Eval Cache
 .longbench_cache/
 
