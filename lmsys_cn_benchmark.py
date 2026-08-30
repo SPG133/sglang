@@ -56,6 +56,7 @@ async def send(session, a, req, index, begin):
     await asyncio.sleep(max(0, begin + planned - time.perf_counter()))
     start, sent_at = time.perf_counter(), iso()
     answer, first_at, error = "", None, None
+    meta = {}  # 流式每个 chunk 都带 meta_info，最后一个 chunk 字段最全
     payload = {
         "input_ids": req["input_ids"], "stream": True,
         "sampling_params": {
@@ -74,7 +75,10 @@ async def send(session, a, req, index, begin):
                     line = line[6:]
                 if not line or line == b"[DONE]":
                     continue
-                text = json.loads(line).get("text", "")
+                chunk = json.loads(line)
+                if chunk.get("meta_info"):
+                    meta = chunk["meta_info"]
+                text = chunk.get("text", "")
                 if text:
                     first_at = first_at or iso()
                     answer = text
@@ -82,6 +86,14 @@ async def send(session, a, req, index, begin):
         error = str(e)
 
     actual = start - begin
+
+    # ===== 服务端新增的 PD 分离计时字段（wall-clock 秒 / 秒列表）=====
+    d_recv_ts = meta.get("d_received_from_p_ts")       # D端从P端接收完成时刻
+    d_done_ts = meta.get("decode_completion_ts")       # D端真正结束时刻
+    round_ts = meta.get("decode_round_durations") or []  # 每轮 batch decode 真实GPU耗时
+
+    d_total_ms = round((d_done_ts - d_recv_ts) * 1000, 3) if d_recv_ts and d_done_ts else None
+
     return {
         "index": index, "prompt": req["prompt"],
         "reference_answer": req["reference"], "generated_answer": answer,
@@ -89,6 +101,14 @@ async def send(session, a, req, index, begin):
         "send_drift_ms": round((actual - planned) * 1000, 3),
         "sent_at": sent_at, "first_token_at": first_at, "finished_at": iso(),
         "latency_ms": round((time.perf_counter() - start) * 1000, 3),
+        # ===== 新增字段 =====
+        "d_received_from_p_ts": d_recv_ts,
+        "decode_completion_ts": d_done_ts,
+        "d_total_ms": d_total_ms,                       # D端排队+decode 总耗时
+        "decode_rounds": len(round_ts),                 # decode 轮数
+        "decode_gpu_time_ms": round(sum(round_ts) * 1000, 3) if round_ts else None,
+        "decode_round_avg_ms": round(sum(round_ts) / len(round_ts) * 1000, 3) if round_ts else None,
+        "decode_round_durations": round_ts,             # 原始逐轮耗时（秒）
         "success": error is None, "error": error,
     }
 
