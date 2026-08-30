@@ -1846,10 +1846,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if num_waiting_reqs is not None:
                     meta_info["num_waiting_reqs"] = num_waiting_reqs
 
-            if self.enable_metrics:
-                if recv_obj.time_stats is not None:
-                    scheduler_time_stats = recv_obj.time_stats[i]
-                    meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
+            # Always surface scheduler-side timing (incl. PD-disagg decode
+            # fields) in meta_info, regardless of --enable-metrics.
+            if recv_obj.time_stats is not None:
+                scheduler_time_stats = recv_obj.time_stats[i]
+                meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(

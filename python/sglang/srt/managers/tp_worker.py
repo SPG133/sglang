@@ -469,10 +469,20 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch)
 
         if self.pp_group.is_last_rank:
+            # Bracket the model forward with CUDA events to capture the real
+            # GPU compute time. record() is async (just a stream marker), so
+            # this does not disturb overlap scheduling. The elapsed time is
+            # read later in batch_result_processor after copy_done sync.
+            # Only the last PP rank executes the full forward, so timing here
+            # avoids double-counting across pipeline stages.
+            fpm_start_event = torch.cuda.Event(enable_timing=True)
+            fpm_end_event = torch.cuda.Event(enable_timing=True)
+            fpm_start_event.record()
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            fpm_end_event.record()
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -480,6 +490,8 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                fpm_start_event=fpm_start_event,
+                fpm_end_event=fpm_end_event,
             )
 
             if is_verify:

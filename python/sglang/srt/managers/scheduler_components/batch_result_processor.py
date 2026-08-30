@@ -79,6 +79,36 @@ class SchedulerBatchResultProcessor:
     output_streamer: "SchedulerOutputStreamer"
     abort_request: Callable
 
+    def _record_fwd_duration(
+        self,
+        result: "GenerationBatchResult",
+        batch: Optional["ScheduleBatch"],
+    ) -> None:
+        """Append this round's GPU forward duration to each req in the batch.
+
+        Must be called AFTER result.copy_done.synchronize(): at that point the
+        GPU side has already been synced, so reading elapsed_time costs nothing
+        extra and yields the true GPU compute time (not CPU launch overhead),
+        even under overlap scheduling and CUDA Graph replay.
+
+        All reqs in the batch share the same duration because they were computed
+        by the same model_runner.forward() call.
+        """
+        if (
+            result.fpm_start_event is None
+            or result.fpm_end_event is None
+            or batch is None
+        ):
+            return
+        try:
+            duration_s = result.fpm_start_event.elapsed_time(result.fpm_end_event) / 1000.0
+        except Exception:
+            return
+        if duration_s <= 0:
+            return
+        for req in batch.reqs:
+            req.time_stats.decode_round_durations.append(duration_s)
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = self.server_args.disaggregation_decode_enable_radix_cache
@@ -185,6 +215,7 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            self._record_fwd_duration(result, batch)
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
@@ -291,6 +322,7 @@ class SchedulerBatchResultProcessor:
         else:  # embedding or reward model
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            self._record_fwd_duration(result, batch)
 
             embeddings = self._convert_embeddings(result=result)
             phs = result.pooled_hidden_states
@@ -582,6 +614,7 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        self._record_fwd_duration(result, batch)
 
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -594,6 +627,7 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        self._record_fwd_duration(result, batch)
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None

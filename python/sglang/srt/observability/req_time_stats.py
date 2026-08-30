@@ -566,6 +566,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     last_prefill_finished_time: float = 0.0
     run_batch_cpu_start_time: float = 0.0
 
+    # Per-round GPU forward duration in seconds (one entry per decode step).
+    # Recorded via CUDA events in tp_worker and read back after copy_done sync,
+    # so the value reflects real GPU compute time even under overlap scheduling.
+    # Populated unconditionally so it reaches client meta_info without
+    # --enable-metrics.
+    decode_round_durations: List[float] = field(default_factory=list)
+
     # speculative decoding
     spec_draft_start_time: float = 0.0
     spec_verify_start_time: float = 0.0
@@ -579,16 +586,19 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     prefill_retry_count: int = 0
 
     def __getstate__(self) -> object:
-        # send to detokenizer/tokenizer
-        if not self.enable_metrics:
-            return {}
-
+        # Pickle projection sent over ZMQ to detokenizer/tokenizer.
+        # The three PD-disagg decode fields are always included so they reach
+        # client meta_info even when --enable-metrics is off. The remaining
+        # metrics-only fields keep the original gating to save bandwidth.
         state = {
             "wait_queue_entry_time": self.wait_queue_entry_time,
-            "forward_entry_time": self.forward_entry_time,
-            "prefill_finished_time": self.prefill_finished_time,
+            "completion_time": self.completion_time,
+            "decode_round_durations": list(self.decode_round_durations),
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
+        if self.enable_metrics:
+            state["forward_entry_time"] = self.forward_entry_time
+            state["prefill_finished_time"] = self.prefill_finished_time
         return state
 
     def set_scheduler_recv_time(self, ts=None):
@@ -1107,6 +1117,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def convert_to_output_meta_info(self):
         meta_data = {}
+        # D-side (PD-disagg) timestamps, converted from perf_counter to
+        # wall-clock for client readability.
+        if self.wait_queue_entry_time > 0.0:
+            meta_data["d_received_from_p_ts"] = convert_time_to_realtime(
+                self.wait_queue_entry_time
+            )
+        if self.completion_time > 0.0:
+            meta_data["decode_completion_ts"] = convert_time_to_realtime(
+                self.completion_time
+            )
+        if self.decode_round_durations:
+            meta_data["decode_round_durations"] = list(self.decode_round_durations)
         if self.forward_entry_time > 0.0:
             meta_data["forward_entry_time"] = convert_time_to_realtime(
                 self.forward_entry_time
