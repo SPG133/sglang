@@ -33,7 +33,12 @@ def load_workload(a):
         prompt, reference = conv[0].get("content", ""), conv[1].get("content", "")
         if not prompt or not reference:
             continue
-        ids = tok.encode(prompt)
+        chat = tok.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        ids = tok.encode(chat)
         output_len = min(len(tok.encode(reference)), a.max_output_tokens)
         if len(ids) > a.max_input_tokens or output_len == 0:
             continue
@@ -64,7 +69,7 @@ async def send(session, a, req, index, begin):
             # 不设上限：生成到 EOS 自然停止。服务端 init_req_max_new_tokens
             # 会 clamp 到上下文剩余长度，传超大值是安全的。
             # 注意不能省略该字段（SGLang 默认 128），也不能开 ignore_eos。
-            "max_new_tokens": 1 << 30,
+            "max_new_tokens": a.max_new_tokens,
         },
     }
 
@@ -138,6 +143,7 @@ if __name__ == "__main__":
     p.add_argument("--request-rate", type=float, default=2)
     p.add_argument("--max-input-tokens", type=int, default=4096)
     p.add_argument("--max-output-tokens", type=int, default=256)
+    p.add_argument("--max-new-tokens", type=int, default=4096)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--output")
     asyncio.run(main(p.parse_args()))

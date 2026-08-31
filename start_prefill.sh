@@ -5,5 +5,5 @@ CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
   --model-path "$MODEL" \
   --port 30000 \
   --disaggregation-mode prefill \
-  --disaggregation-transfer-backend mooncake \
+  --disaggregation-transfer-backend nixl \
   --disable-radix-cache
