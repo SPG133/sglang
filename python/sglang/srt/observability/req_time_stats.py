@@ -566,12 +566,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     last_prefill_finished_time: float = 0.0
     run_batch_cpu_start_time: float = 0.0
 
-    # Per-round GPU forward duration in seconds (one entry per decode step).
-    # Recorded via CUDA events in tp_worker and read back after copy_done sync,
-    # so the value reflects real GPU compute time even under overlap scheduling.
-    # Populated unconditionally so it reaches client meta_info without
-    # --enable-metrics.
-    decode_round_durations: List[float] = field(default_factory=list)
+    # Accumulated GPU forward time in seconds across all decode rounds of
+    # this request. Recorded via CUDA events in tp_worker and read back after
+    # copy_done sync (true GPU compute time even under overlap scheduling).
+    # Updated sequentially on the single-threaded scheduler — no locking.
+    decode_gpu_total_time: float = 0.0
 
     # speculative decoding
     spec_draft_start_time: float = 0.0
@@ -593,7 +592,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         state = {
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "completion_time": self.completion_time,
-            "decode_round_durations": list(self.decode_round_durations),
+            "decode_gpu_total_time": self.decode_gpu_total_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         if self.enable_metrics:
@@ -1127,8 +1126,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             meta_data["decode_completion_ts"] = convert_time_to_realtime(
                 self.completion_time
             )
-        if self.decode_round_durations:
-            meta_data["decode_round_durations"] = list(self.decode_round_durations)
+        if self.decode_gpu_total_time > 0.0:
+            meta_data["decode_gpu_total_time"] = self.decode_gpu_total_time
         if self.forward_entry_time > 0.0:
             meta_data["forward_entry_time"] = convert_time_to_realtime(
                 self.forward_entry_time

@@ -84,15 +84,15 @@ class SchedulerBatchResultProcessor:
         result: "GenerationBatchResult",
         batch: Optional["ScheduleBatch"],
     ) -> None:
-        """Append this round's GPU forward duration to each req in the batch.
+        """Accumulate this round's GPU forward duration into each req.
 
         Must be called AFTER result.copy_done.synchronize(): at that point the
         GPU side has already been synced, so reading elapsed_time costs nothing
         extra and yields the true GPU compute time (not CPU launch overhead),
         even under overlap scheduling and CUDA Graph replay.
 
-        All reqs in the batch share the same duration because they were computed
-        by the same model_runner.forward() call.
+        Runs on the single-threaded scheduler; each req belongs to exactly one
+        batch at a time, so the += accumulation needs no locking.
         """
         if (
             result.fpm_start_event is None
@@ -107,7 +107,7 @@ class SchedulerBatchResultProcessor:
         if duration_s <= 0:
             return
         for req in batch.reqs:
-            req.time_stats.decode_round_durations.append(duration_s)
+            req.time_stats.decode_gpu_total_time += duration_s
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE

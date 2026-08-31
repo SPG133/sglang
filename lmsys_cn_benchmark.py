@@ -60,8 +60,11 @@ async def send(session, a, req, index, begin):
     payload = {
         "input_ids": req["input_ids"], "stream": True,
         "sampling_params": {
-            "temperature": 0, "ignore_eos": True,
-            "max_new_tokens": req["output_len"],
+            "temperature": 0,
+            # 不设上限：生成到 EOS 自然停止。服务端 init_req_max_new_tokens
+            # 会 clamp 到上下文剩余长度，传超大值是安全的。
+            # 注意不能省略该字段（SGLang 默认 128），也不能开 ignore_eos。
+            "max_new_tokens": 1 << 30,
         },
     }
 
@@ -87,10 +90,10 @@ async def send(session, a, req, index, begin):
 
     actual = start - begin
 
-    # ===== 服务端新增的 PD 分离计时字段（wall-clock 秒 / 秒列表）=====
+    # ===== 服务端新增的 PD 分离计时字段 =====
     d_recv_ts = meta.get("d_received_from_p_ts")       # D端从P端接收完成时刻
     d_done_ts = meta.get("decode_completion_ts")       # D端真正结束时刻
-    round_ts = meta.get("decode_round_durations") or []  # 每轮 batch decode 真实GPU耗时
+    gpu_total_s = meta.get("decode_gpu_total_time")    # 整个 decode 的 GPU 总耗时（秒）
 
     d_total_ms = round((d_done_ts - d_recv_ts) * 1000, 3) if d_recv_ts and d_done_ts else None
 
@@ -105,10 +108,9 @@ async def send(session, a, req, index, begin):
         "d_received_from_p_ts": d_recv_ts,
         "decode_completion_ts": d_done_ts,
         "d_total_ms": d_total_ms,                       # D端排队+decode 总耗时
-        "decode_rounds": len(round_ts),                 # decode 轮数
-        "decode_gpu_time_ms": round(sum(round_ts) * 1000, 3) if round_ts else None,
-        "decode_round_avg_ms": round(sum(round_ts) / len(round_ts) * 1000, 3) if round_ts else None,
-        "decode_round_durations": round_ts,             # 原始逐轮耗时（秒）
+        "decode_gpu_time_ms": round(gpu_total_s * 1000, 3) if gpu_total_s else None,
+        "completion_tokens": meta.get("completion_tokens"),  # 真实输出长度（不再固定）
+        "finish_reason": (meta.get("finish_reason") or {}).get("type"),
         "success": error is None, "error": error,
     }
 
