@@ -144,6 +144,10 @@ class CacheAgnosticPolicy(Enum):
     LOF = "lof"  # longest output first
     RANDOM = "random"
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
+    # Accepted so that --schedule-policy mlfq validates. The MLFQ behavior
+    # itself lives on the disagg decode side (disaggregation/decode.py);
+    # the unified / prefill admission path keeps FCFS order.
+    MLFQ = "mlfq"
 
 
 class SchedulePolicy:
@@ -205,6 +209,11 @@ class SchedulePolicy:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
             if policy == CacheAgnosticPolicy.FCFS:
+                pass
+            elif policy == CacheAgnosticPolicy.MLFQ:
+                # No-op here: MLFQ ordering is applied on the disagg decode
+                # side (disaggregation/decode.py). Unified / prefill admission
+                # keeps FCFS order.
                 pass
             elif policy == CacheAgnosticPolicy.LOF:
                 SchedulePolicy._sort_by_longest_output(

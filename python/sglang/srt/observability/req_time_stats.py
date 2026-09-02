@@ -572,6 +572,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # Updated sequentially on the single-threaded scheduler — no locking.
     decode_gpu_total_time: float = 0.0
 
+    # Wall-clock seconds when the P side finished prefill, piggybacked through
+    # the transfer metadata buffer (bootstrap_room slot 1) and read on the D
+    # side at _commit_transfer_to_req. 0.0 until the transfer commits.
+    p_prefill_finished_walltime: float = 0.0
+
     # speculative decoding
     spec_draft_start_time: float = 0.0
     spec_verify_start_time: float = 0.0
@@ -591,12 +596,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         # metrics-only fields keep the original gating to save bandwidth.
         state = {
             "wait_queue_entry_time": self.wait_queue_entry_time,
+            "forward_entry_time": self.forward_entry_time,
             "completion_time": self.completion_time,
             "decode_gpu_total_time": self.decode_gpu_total_time,
+            "p_prefill_finished_walltime": self.p_prefill_finished_walltime,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         if self.enable_metrics:
-            state["forward_entry_time"] = self.forward_entry_time
             state["prefill_finished_time"] = self.prefill_finished_time
         return state
 
@@ -1128,9 +1134,22 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             )
         if self.decode_gpu_total_time > 0.0:
             meta_data["decode_gpu_total_time"] = self.decode_gpu_total_time
+        # Already wall-clock (written by the P side), no conversion needed.
+        if self.p_prefill_finished_walltime > 0.0:
+            meta_data["p_prefill_finished_ts"] = self.p_prefill_finished_walltime
         if self.forward_entry_time > 0.0:
             meta_data["forward_entry_time"] = convert_time_to_realtime(
                 self.forward_entry_time
+            )
+        # True D-side wait: from "P finished prefill" to "first scheduled into
+        # a decode batch". Covers prealloc wait + KV transfer + waiting-queue
+        # wait in one number. forward_entry_time is D-side perf_counter
+        # converted to wall-clock; p_prefill_finished_walltime is wall-clock
+        # from P — same machine, directly comparable.
+        if self.forward_entry_time > 0.0 and self.p_prefill_finished_walltime > 0.0:
+            meta_data["d_true_wait_s"] = (
+                convert_time_to_realtime(self.forward_entry_time)
+                - self.p_prefill_finished_walltime
             )
         if self.prefill_finished_time > 0.0:
             meta_data["prefill_finished_time"] = convert_time_to_realtime(

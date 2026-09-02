@@ -3658,10 +3658,27 @@ class Scheduler(
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
-            for decode_req in self.disagg_decode_prealloc_queue.queue:
+            prealloc_q = self.disagg_decode_prealloc_queue
+            to_remove_rids = set()
+            for decode_req in prealloc_q.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
+                    if decode_req.kv_receiver is not None:
+                        decode_req.kv_receiver.abort()
+                    else:
+                        # Single-queue MLFQ mode: retracted entries have no
+                        # receiver; free their CPU-resident KV and notify the
+                        # tokenizer directly, then drop them from the queue.
+                        if getattr(decode_req.req, "kv_cache_cpu", None) is not None:
+                            del decode_req.req.kv_cache_cpu
+                        self.ipc_channels.send_to_tokenizer.send_output(
+                            AbortReq(rid=decode_req.req.rid), decode_req.req
+                        )
+                        to_remove_rids.add(decode_req.req.rid)
+            if to_remove_rids:
+                prealloc_q.queue = [
+                    d for d in prealloc_q.queue if d.req.rid not in to_remove_rids
+                ]
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:

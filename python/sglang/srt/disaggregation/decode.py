@@ -95,6 +95,45 @@ if TYPE_CHECKING:
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
+# MLFQ (multi-level feedback queue) scheduling on the decode server.
+#
+# Rules (mirroring classic MLFQ):
+#   1. A request's level derives from its attained GPU service
+#      (req.time_stats.decode_gpu_total_time, which survives retraction).
+#   2. The scheduler always prefers the lowest-level (least-served) requests.
+#   3. New requests (P just finished, 0 service) enter at level 0.
+#   4. Crossing a level boundary under memory pressure -> demote by one level:
+#      the request is retracted to CPU and re-competes with its history.
+#
+# Active only when the server is launched with --schedule-policy mlfq.
+
+# Level boundaries in seconds of attained GPU service, calibrated from the
+# lmsys-cn workload decode-round distribution (p50=312 rounds, p80=1190 rounds
+# at ~26ms/round): L0 = [0, 8.1s) covers 50%, L1 = [8.1s, 31s) covers 80%,
+# L2 = [31s, +inf) runs to completion.
+MLFQ_LEVEL_THRESHOLDS_S = (8.1, 31.0)
+
+
+def mlfq_level(req: "Req") -> int:
+    """Current MLFQ level of a request from its attained GPU service."""
+    t = req.time_stats.decode_gpu_total_time
+    level = 0
+    for threshold in MLFQ_LEVEL_THRESHOLDS_S:
+        if t >= threshold:
+            level += 1
+    return level
+
+
+def mlfq_sort_reqs(reqs: List["Req"]) -> None:
+    """Sort by (level, attained service, arrival) — least-served first."""
+    reqs.sort(
+        key=lambda r: (
+            mlfq_level(r),
+            r.time_stats.decode_gpu_total_time,
+            r.time_stats.wait_queue_entry_time,
+        )
+    )
+
 
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
@@ -467,7 +506,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         if is_retracted:
             req.retraction_mb_id = None
-            self.retracted_queue.append(req)
+            if self.scheduler.server_args.schedule_policy == "mlfq":
+                # MLFQ demotion: the retracted request re-joins the prealloc
+                # queue and competes with new arrivals under the same policy.
+                # Its KV was offloaded to CPU on retract (req.kv_cache_cpu)
+                # and is loaded back on admission -- no re-transfer from
+                # prefill. kv_receiver is dead after the first transfer, hence
+                # None; waiting_for_input=True lets it skip handshake polling.
+                self.queue.append(
+                    DecodeRequest(req=req, kv_receiver=None, waiting_for_input=True)
+                )
+            else:
+                self.retracted_queue.append(req)
         else:
             decode_req = self._create_receiver_and_enqueue(req)
 
@@ -618,21 +668,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _update_handshake_waiters(
         self, rids_to_check: Optional[List[str]] = None
     ) -> None:
-        if not self.queue:
+        # Entries with kv_receiver=None are retracted requests whose KV is
+        # already CPU-resident (single-queue MLFQ mode); they need no polling.
+        live = [d for d in self.queue if d.kv_receiver is not None]
+        if not live:
             return
 
         # Still poll if any receiver was aborted, otherwise it stays stuck.
-        if all(decode_req.waiting_for_input for decode_req in self.queue) and not any(
-            decode_req.kv_receiver.conclude_state == KVPoll.Failed
-            for decode_req in self.queue
+        if all(d.waiting_for_input for d in live) and not any(
+            d.kv_receiver.conclude_state == KVPoll.Failed for d in live
         ):
             return
 
         polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+            [d.kv_receiver for d in live], self.gloo_group
         )
 
-        for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+        for decode_req, poll in zip(live, polls):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
@@ -796,6 +848,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
 
+        # MLFQ: one queue, one policy. New requests (level 0) and demoted
+        # requests (level >= 1, service history preserved) compete together,
+        # ordered so the lowest level / least-served get memory first.
+        if self.scheduler.server_args.schedule_policy == "mlfq":
+            self.queue.sort(
+                key=lambda dr: (
+                    mlfq_level(dr.req),
+                    dr.req.time_stats.decode_gpu_total_time,
+                    dr.req.time_stats.wait_queue_entry_time,
+                )
+            )
+
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -824,6 +888,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         # Then, preallocate the remaining requests if possible
+        resumed_reqs: List[Req] = []
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -836,6 +901,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if self.req_to_token_pool.available_size() <= 0:
                 break
+
+            # Demoted request (MLFQ): its KV is already CPU-resident, so skip
+            # handshake/metadata/transfer entirely and just reclaim GPU memory.
+            # No receiver exists on this entry.
+            if decode_req.kv_receiver is None:
+                full_required, _ = self._prealloc_required_tokens(decode_req.req)
+                if full_required > full_allocatable_tokens:
+                    break
+                decode_req.req.is_retracted = False
+                self._pre_alloc(decode_req.req)
+                decode_req.req.load_kv_cache(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
+                full_allocatable_tokens -= full_required
+                resumed_reqs.append(decode_req.req)
+                indices_to_remove.add(i)
+                continue
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
@@ -1049,6 +1131,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+
+        # Demoted requests resumed inline above bypass the transfer queue
+        # (their KV came from CPU, not from prefill); admit them directly.
+        if resumed_reqs:
+            self.scheduler.waiting_queue.extend(resumed_reqs)
 
         return preallocated_reqs, failed_reqs
 
@@ -1546,6 +1633,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
+        # P side piggybacks its prefill-finish wall-clock into the spare
+        # bootstrap_room slot 1 (see MetadataBuffers.set_buf).
+        p_finish_ns = output_bootstrap_room[1].item()
+        if p_finish_ns > 0:
+            decode_req.req.time_stats.p_prefill_finished_walltime = (
+                p_finish_ns / 1e9
+            )
         return
 
     def _poll_with_metadata_gate(self) -> List[int]:
@@ -1780,6 +1874,46 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
+    def _mlfq_rotate_running_batch(self: Scheduler) -> None:
+        """Demote the deepest-level running request under memory pressure.
+
+        A request is eligible once its level exceeds the number of times it has
+        already been retracted (level(service) > retraction_count), i.e. it has
+        consumed a level allotment it was never demoted for. The victim's KV is
+        offloaded to CPU by the standard PD-decode release path, and it
+        re-competes in the prealloc queue with its service history preserved.
+
+        With the default thresholds this gives: kick once at 8.1s (L0->L1),
+        once at 31s (L1->L2), then run to completion (L2 has no boundary).
+        """
+        running = self.running_batch.reqs
+        if not running or len(self.disagg_decode_prealloc_queue.queue) == 0:
+            return
+
+        candidates = [
+            (i, r)
+            for i, r in enumerate(running)
+            if mlfq_level(r) > r.retraction_count
+        ]
+        if not candidates:
+            return
+
+        victim_idx, victim = max(
+            candidates, key=lambda x: x[1].time_stats.decode_gpu_total_time
+        )
+        logger.info(
+            f"MLFQ rotation: demote {victim.rid=} level={mlfq_level(victim)} "
+            f"after {victim.time_stats.decode_gpu_total_time:.3f}s GPU service "
+            f"({len(self.disagg_decode_prealloc_queue.queue)} queued)"
+        )
+        self.running_batch.release_req(
+            victim_idx, len(running) - 1, self.server_args
+        )
+        self.running_batch.filter_batch(
+            keep_indices=[i for i in range(len(running)) if i != victim_idx]
+        )
+        self._add_request_to_queue(victim, is_retracted=True)
+
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
@@ -1802,6 +1936,12 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     self.running_batch.merge_batch(new_prebuilt_batch)
 
+        # MLFQ rotation: demote a request that crossed a level boundary while
+        # others are queued for memory. Runs before update_running_batch (which
+        # prepares the decode tensors), so the batch stays consistent.
+        if self.server_args.schedule_policy == "mlfq":
+            self._mlfq_rotate_running_batch()
+
         # Schedule decode batch
         if self.running_batch.is_empty():
             ret = None
@@ -1823,6 +1963,12 @@ class SchedulerDisaggregationDecodeMixin:
 
         if len(self.waiting_queue) == 0:
             return None
+
+        # MLFQ: admit lowest-level (least-served) requests first. Fresh
+        # requests whose prefill just finished are level 0 and enter ahead;
+        # demoted requests re-enter here with their service history.
+        if self.server_args.schedule_policy == "mlfq":
+            mlfq_sort_reqs(self.waiting_queue)
 
         if self.enable_priority_scheduling:
             self.policy.calc_priority(self.waiting_queue, self.running_batch)
@@ -1889,12 +2035,16 @@ class SchedulerDisaggregationDecodeMixin:
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
-        # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-        resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
-        self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
-            return
+        if self.server_args.schedule_policy != "mlfq":
+            # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
+            resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+            self.waiting_queue.extend(resumed_reqs)
+            if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
+                # if there are still retracted requests, we do not allocate new requests
+                return
+        # MLFQ single-queue mode: demoted requests live in the prealloc queue
+        # itself and compete in pop_preallocated under the same policy as new
+        # arrivals, so there is no separate resume step here.
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0

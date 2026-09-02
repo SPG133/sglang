@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -359,6 +360,13 @@ class MetadataBuffers:
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
+        )
+        # Piggyback the prefill-finish wall-clock (ns) into a spare slot of the
+        # bootstrap_room buffer, so the decode side learns when P finished.
+        # perf_counter -> wall-clock conversion mirrors convert_time_to_realtime.
+        pf = req.time_stats.prefill_finished_time
+        self.bootstrap_room[req.metadata_buffer_index, 1] = (
+            int((pf + (time.time() - time.perf_counter())) * 1e9) if pf > 0 else 0
         )
 
 
