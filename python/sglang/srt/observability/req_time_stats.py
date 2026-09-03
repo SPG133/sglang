@@ -577,6 +577,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # side at _commit_transfer_to_req. 0.0 until the transfer commits.
     p_prefill_finished_walltime: float = 0.0
 
+    # 请求到达 P 端（进入 bootstrap 队列）的 wall-clock 秒，经 metadata buffer
+    # slot 2 搭带到 D 端。作为生命周期占比指标的分母起点。
+    p_arrival_walltime: float = 0.0
+
+    # P 端 prefill 实际 GPU 计算耗时（秒），逐 forward 用 CUDA event 累加，
+    # 经 metadata buffer slot 3 搭带到 D 端。
+    prefill_gpu_total_time: float = 0.0
+
     # speculative decoding
     spec_draft_start_time: float = 0.0
     spec_verify_start_time: float = 0.0
@@ -600,6 +608,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "completion_time": self.completion_time,
             "decode_gpu_total_time": self.decode_gpu_total_time,
             "p_prefill_finished_walltime": self.p_prefill_finished_walltime,
+            "p_arrival_walltime": self.p_arrival_walltime,
+            "prefill_gpu_total_time": self.prefill_gpu_total_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         if self.enable_metrics:
@@ -695,6 +705,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.last_forward_entry_time = 0.0
         self.last_prefill_finished_time = 0.0
         self.last_chunked_prefill_finish_time = 0.0
+        # 重试会重跑 prefill，清零避免重复累计 GPU 时间
+        self.prefill_gpu_total_time = 0.0
 
     def set_wait_queue_entry_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -1168,6 +1180,27 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 meta_data["d_gpu_fraction"] = (
                     self.decode_gpu_total_time / dwell_s
                 )
+        # 生命周期占比：分母统一为「请求到达 P 端 → D 端完成」的墙钟总时长，
+        # 分子分别是 decode GPU 实际计算时间和 prefill GPU 实际计算时间。
+        # 剩余部分（1 - 两者之和）即全部排队/交接开销。
+        if self.completion_time > 0.0 and self.p_arrival_walltime > 0.0:
+            life_s = (
+                convert_time_to_realtime(self.completion_time)
+                - self.p_arrival_walltime
+            )
+            if life_s > 0:
+                if self.decode_gpu_total_time > 0.0:
+                    meta_data["d_decode_life_fraction"] = (
+                        self.decode_gpu_total_time / life_s
+                    )
+                if self.prefill_gpu_total_time > 0.0:
+                    meta_data["d_prefill_life_fraction"] = (
+                        self.prefill_gpu_total_time / life_s
+                    )
+        if self.prefill_gpu_total_time > 0.0:
+            meta_data["prefill_gpu_total_time"] = self.prefill_gpu_total_time
+        if self.p_arrival_walltime > 0.0:
+            meta_data["p_arrival_ts"] = self.p_arrival_walltime
         if self.prefill_finished_time > 0.0:
             meta_data["prefill_finished_time"] = convert_time_to_realtime(
                 self.prefill_finished_time

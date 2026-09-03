@@ -368,6 +368,18 @@ class MetadataBuffers:
         self.bootstrap_room[req.metadata_buffer_index, 1] = (
             int((pf + (time.time() - time.perf_counter())) * 1e9) if pf > 0 else 0
         )
+        # slot 2: 请求到达 P 端（bootstrap 队列入口）的 wall-clock（ns），
+        # 作为生命周期占比指标的分母起点
+        arrival = req.time_stats.prefill_bootstrap_queue_entry_time
+        self.bootstrap_room[req.metadata_buffer_index, 2] = (
+            int((arrival + (time.time() - time.perf_counter())) * 1e9)
+            if arrival > 0
+            else 0
+        )
+        # slot 3: P 端 prefill GPU 累计耗时（ns），供 prefill 生命周期占比指标
+        self.bootstrap_room[req.metadata_buffer_index, 3] = int(
+            req.time_stats.prefill_gpu_total_time * 1e9
+        )
 
 
 #########################

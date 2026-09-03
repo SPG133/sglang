@@ -102,6 +102,10 @@ async def send(session, a, req, index, begin):
     true_wait_s = meta.get("d_true_wait_s")            # 真正的 D 端等待（P完成→首次decode）
     gpu_fraction = meta.get("d_gpu_fraction")          # 最终指标：GPU时间/(true_wait+d_total)
     p_finish_ts = meta.get("p_prefill_finished_ts")    # P 端 prefill 完成的 wall-clock
+    decode_life = meta.get("d_decode_life_fraction")   # decode GPU / (到达P→D完成) 生命周期占比
+    prefill_life = meta.get("d_prefill_life_fraction") # prefill GPU / (到达P→D完成) 生命周期占比
+    p_arrival_ts = meta.get("p_arrival_ts")            # 请求到达 P 端的 wall-clock
+    prefill_gpu_ms = meta.get("prefill_gpu_total_time")  # P 端 prefill GPU 实际耗时（秒）
 
     d_total_ms = round((d_done_ts - d_recv_ts) * 1000, 3) if d_recv_ts and d_done_ts else None
 
@@ -120,6 +124,10 @@ async def send(session, a, req, index, begin):
         "true_wait_ms": round(true_wait_s * 1000, 3) if true_wait_s is not None else None,
         "gpu_fraction": round(gpu_fraction, 6) if gpu_fraction is not None else None,
         "p_prefill_finished_ts": p_finish_ts,
+        "decode_life_fraction": round(decode_life, 6) if decode_life is not None else None,
+        "prefill_life_fraction": round(prefill_life, 6) if prefill_life is not None else None,
+        "p_arrival_ts": p_arrival_ts,
+        "prefill_gpu_time_ms": round(prefill_gpu_ms * 1000, 3) if prefill_gpu_ms else None,
         "completion_tokens": meta.get("completion_tokens"),  # 真实输出长度（不再固定）
         "finish_reason": (meta.get("finish_reason") or {}).get("type"),
         "success": error is None, "error": error,
@@ -133,7 +141,11 @@ async def main(a):
         results = await asyncio.gather(*[
             send(session, a, req, i, begin) for i, req in enumerate(workload)
         ])
-    output = a.output or datetime.now().strftime("lmsys_cn_%Y%m%d_%H%M%S.jsonl")
+    # 默认保存到数据分析文件夹（data_analysis/qwen3-8B/），目录不存在则自动创建
+    output = a.output or str(
+        Path("data_analysis") / "qwen3-8B" / datetime.now().strftime("lmsys_cn_%Y%m%d_%H%M%S.jsonl")
+    )
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
     Path(output).write_text("".join(
         json.dumps(x, ensure_ascii=False) + "\n" for x in results
     ), encoding="utf-8")

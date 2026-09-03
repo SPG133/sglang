@@ -519,6 +519,20 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        # 读取 CUDA events，把本轮 prefill forward 的真实 GPU 计算时长
+        # 累加到 batch 内每个请求（与 D 端 decode_gpu_total_time 同一套机制）。
+        # 必须在 copy_done.synchronize() 之后读，此时 GPU 已同步。
+        if result.fpm_start_event is not None and result.fpm_end_event is not None:
+            try:
+                prefill_dur_s = (
+                    result.fpm_start_event.elapsed_time(result.fpm_end_event)
+                    / 1000.0
+                )
+                if prefill_dur_s > 0:
+                    for req in batch.reqs:
+                        req.time_stats.prefill_gpu_total_time += prefill_dur_s
+            except Exception:
+                pass
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None

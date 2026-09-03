@@ -1640,6 +1640,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.time_stats.p_prefill_finished_walltime = (
                 p_finish_ns / 1e9
             )
+        # slot 2: 请求到达 P 端的 wall-clock；slot 3: P 端 prefill GPU 累计耗时
+        p_arrival_ns = output_bootstrap_room[2].item()
+        if p_arrival_ns > 0:
+            decode_req.req.time_stats.p_arrival_walltime = p_arrival_ns / 1e9
+        prefill_gpu_ns = output_bootstrap_room[3].item()
+        if prefill_gpu_ns > 0:
+            decode_req.req.time_stats.prefill_gpu_total_time = (
+                prefill_gpu_ns / 1e9
+            )
         return
 
     def _poll_with_metadata_gate(self) -> List[int]:
