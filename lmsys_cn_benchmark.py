@@ -101,6 +101,7 @@ async def send(session, a, req, index, begin):
     gpu_total_s = meta.get("decode_gpu_total_time")    # 整个 decode 的 GPU 总耗时（秒）
     true_wait_s = meta.get("d_true_wait_s")            # 真正的 D 端等待（P完成→首次decode）
     gpu_fraction = meta.get("d_gpu_fraction")          # 最终指标：GPU时间/(true_wait+d_total)
+    p_finish_ts = meta.get("p_prefill_finished_ts")    # P 端 prefill 完成的 wall-clock
 
     d_total_ms = round((d_done_ts - d_recv_ts) * 1000, 3) if d_recv_ts and d_done_ts else None
 
@@ -118,6 +119,7 @@ async def send(session, a, req, index, begin):
         "decode_gpu_time_ms": round(gpu_total_s * 1000, 3) if gpu_total_s else None,
         "true_wait_ms": round(true_wait_s * 1000, 3) if true_wait_s is not None else None,
         "gpu_fraction": round(gpu_fraction, 6) if gpu_fraction is not None else None,
+        "p_prefill_finished_ts": p_finish_ts,
         "completion_tokens": meta.get("completion_tokens"),  # 真实输出长度（不再固定）
         "finish_reason": (meta.get("finish_reason") or {}).get("type"),
         "success": error is None, "error": error,
