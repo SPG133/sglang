@@ -1151,6 +1151,23 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 convert_time_to_realtime(self.forward_entry_time)
                 - self.p_prefill_finished_walltime
             )
+        # Final fairness metric: GPU compute time over total D-side dwell
+        # from "P finished prefill" to "request completion on D"
+        # (non-overlapping: prealloc wait + KV transfer + waiting-queue wait
+        # + decode residence, each segment counted exactly once).
+        if (
+            self.decode_gpu_total_time > 0.0
+            and self.completion_time > 0.0
+            and self.p_prefill_finished_walltime > 0.0
+        ):
+            dwell_s = (
+                convert_time_to_realtime(self.completion_time)
+                - self.p_prefill_finished_walltime
+            )
+            if dwell_s > 0:
+                meta_data["d_gpu_fraction"] = (
+                    self.decode_gpu_total_time / dwell_s
+                )
         if self.prefill_finished_time > 0.0:
             meta_data["prefill_finished_time"] = convert_time_to_realtime(
                 self.prefill_finished_time

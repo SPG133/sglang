@@ -1875,21 +1875,30 @@ class SchedulerDisaggregationDecodeMixin:
         return GenerationBatchResult()
 
     def _mlfq_rotate_running_batch(self: Scheduler) -> None:
-        """Demote the deepest-level running request under memory pressure.
+        """显存压力下，把层级最深的 running 请求降级踢出。
 
-        A request is eligible once its level exceeds the number of times it has
-        already been retracted (level(service) > retraction_count), i.e. it has
-        consumed a level allotment it was never demoted for. The victim's KV is
-        offloaded to CPU by the standard PD-decode release path, and it
-        re-competes in the prealloc queue with its service history preserved.
+        踢出条件：请求的当前层级超过了它已被踢出的次数
+        （mlfq_level(req) > req.retraction_count），即它用完了
+        某一层级的配额但还没为此降过级。
 
-        With the default thresholds this gives: kick once at 8.1s (L0->L1),
-        once at 31s (L1->L2), then run to completion (L2 has no boundary).
+        被踢请求的 KV 走标准 PD-decode 释放路径换出到 CPU，
+        已消耗的 GPU 服务时间保留，回到 prealloc 队列重新竞争。
+
+        默认阈值下的行为：8.1 秒踢一次（L0→L1），31 秒踢一次
+        （L1→L2），之后不再打断直到完成（L2 没有下一级边界）。
         """
         running = self.running_batch.reqs
-        if not running or len(self.disagg_decode_prealloc_queue.queue) == 0:
+        # 只统计真正在等显存的条目：握手完成的（waiting_for_input=True，
+        # 含被踢回来等恢复的，add() 时已设 True）。排除还在握手中的
+        # 新请求——它们拿到显存也暂时用不上，踢人给它们让位是空转。
+        ready_waiters = sum(
+            1 for d in self.disagg_decode_prealloc_queue.queue if d.waiting_for_input
+        )
+        # 没人在跑，或没人真正在等显存，就不需要轮换
+        if not running or ready_waiters == 0:
             return
 
+        # 筛出"用完了当前层级配额但还没降过级"的候选
         candidates = [
             (i, r)
             for i, r in enumerate(running)
@@ -1898,20 +1907,24 @@ class SchedulerDisaggregationDecodeMixin:
         if not candidates:
             return
 
+        # 挑层级最深（已消耗 GPU 时间最多）的作为牺牲者
         victim_idx, victim = max(
             candidates, key=lambda x: x[1].time_stats.decode_gpu_total_time
         )
         logger.info(
             f"MLFQ rotation: demote {victim.rid=} level={mlfq_level(victim)} "
             f"after {victim.time_stats.decode_gpu_total_time:.3f}s GPU service "
-            f"({len(self.disagg_decode_prealloc_queue.queue)} queued)"
+            f"({ready_waiters} ready waiters)"
         )
+        # 释放牺牲者：KV 换出到 CPU、释放 GPU 槽位（PD-decode 路径）
         self.running_batch.release_req(
             victim_idx, len(running) - 1, self.server_args
         )
+        # 从 running batch 中移除，保持张量一致
         self.running_batch.filter_batch(
             keep_indices=[i for i in range(len(running)) if i != victim_idx]
         )
+        # 放回 prealloc 队列（mlfq 模式下进 self.queue，带服务历史）
         self._add_request_to_queue(victim, is_retracted=True)
 
     def get_next_disagg_decode_batch_to_run(
