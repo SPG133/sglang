@@ -3666,9 +3666,9 @@ class Scheduler(
                     if decode_req.kv_receiver is not None:
                         decode_req.kv_receiver.abort()
                     else:
-                        # Single-queue MLFQ mode: retracted entries have no
-                        # receiver; free their CPU-resident KV and notify the
-                        # tokenizer directly, then drop them from the queue.
+                        # 单队列 MLFQ 模式：被驱逐的条目没有接收器；
+                        # 释放其 CPU 上的 KV、直接通知 tokenizer，
+                        # 然后从队列中移除。
                         if getattr(decode_req.req, "kv_cache_cpu", None) is not None:
                             del decode_req.req.kv_cache_cpu
                         self.ipc_channels.send_to_tokenizer.send_output(

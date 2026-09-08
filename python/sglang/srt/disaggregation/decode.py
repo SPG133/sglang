@@ -95,27 +95,26 @@ if TYPE_CHECKING:
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
-# MLFQ (multi-level feedback queue) scheduling on the decode server.
+# decode 端的 MLFQ（多级反馈队列）调度。
 #
-# Rules (mirroring classic MLFQ):
-#   1. A request's level derives from its attained GPU service
-#      (req.time_stats.decode_gpu_total_time, which survives retraction).
-#   2. The scheduler always prefers the lowest-level (least-served) requests.
-#   3. New requests (P just finished, 0 service) enter at level 0.
-#   4. Crossing a level boundary under memory pressure -> demote by one level:
-#      the request is retracted to CPU and re-competes with its history.
+# 规则（镜像经典 MLFQ）：
+#   1. 请求的层级由其已获得的 GPU 服务时长决定
+#      （req.time_stats.decode_gpu_total_time，驱逐后仍保留）。
+#   2. 调度器总是优先层级最低（受益最少）的请求。
+#   3. 新请求（P 刚完成、服务时长为 0）从 L0 进入。
+#   4. 显存压力下跨过层级边界 -> 降一级：请求被换出到 CPU，
+#      带着服务历史重新参与竞争。
 #
-# Active only when the server is launched with --schedule-policy mlfq.
+# 仅当服务以 --schedule-policy mlfq 启动时生效。
 
-# Level boundaries in seconds of attained GPU service, calibrated from the
-# lmsys-cn workload decode-round distribution (p50=312 rounds, p80=1190 rounds
-# at ~26ms/round): L0 = [0, 8.1s) covers 50%, L1 = [8.1s, 31s) covers 80%,
-# L2 = [31s, +inf) runs to completion.
+# 层级边界（按已获 GPU 服务秒数），由 lmsys-cn 负载的 decode 轮次分布
+# 校准（p50=312 轮、p80=1190 轮，约 26ms/轮）：
+# L0 = [0, 8.1s) 覆盖 50%，L1 = [8.1s, 31s) 覆盖 80%，L2 = [31s, +inf) 跑到完成。
 MLFQ_LEVEL_THRESHOLDS_S = (8.1, 31.0)
 
 
 def mlfq_level(req: "Req") -> int:
-    """Current MLFQ level of a request from its attained GPU service."""
+    """按已获 GPU 服务时长返回请求当前的 MLFQ 层级。"""
     t = req.time_stats.decode_gpu_total_time
     level = 0
     for threshold in MLFQ_LEVEL_THRESHOLDS_S:
@@ -125,7 +124,7 @@ def mlfq_level(req: "Req") -> int:
 
 
 def mlfq_sort_reqs(reqs: List["Req"]) -> None:
-    """Sort by (level, attained service, arrival) — least-served first."""
+    """按（层级, 已获服务, 到达序）排序——受益最少者优先。"""
     reqs.sort(
         key=lambda r: (
             mlfq_level(r),
@@ -507,12 +506,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if is_retracted:
             req.retraction_mb_id = None
             if self.scheduler.server_args.schedule_policy == "mlfq":
-                # MLFQ demotion: the retracted request re-joins the prealloc
-                # queue and competes with new arrivals under the same policy.
-                # Its KV was offloaded to CPU on retract (req.kv_cache_cpu)
-                # and is loaded back on admission -- no re-transfer from
-                # prefill. kv_receiver is dead after the first transfer, hence
-                # None; waiting_for_input=True lets it skip handshake polling.
+                # MLFQ 降级：被驱逐的请求回到 prealloc 队列，与新请求在
+                # 同一策略下竞争。驱逐时其 KV 已换出到 CPU（req.kv_cache_cpu），
+                # 准入时直接载回，无需从 prefill 重新传输。kv_receiver 在首次
+                # 传输后已销毁，故为 None；waiting_for_input=True 使其跳过握手轮询。
                 self.queue.append(
                     DecodeRequest(req=req, kv_receiver=None, waiting_for_input=True)
                 )
@@ -668,13 +665,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _update_handshake_waiters(
         self, rids_to_check: Optional[List[str]] = None
     ) -> None:
-        # Entries with kv_receiver=None are retracted requests whose KV is
-        # already CPU-resident (single-queue MLFQ mode); they need no polling.
+        # kv_receiver=None 的条目是被驱逐的请求，其 KV 已在 CPU 上
+        # （单队列 MLFQ 模式），无需轮询。
         live = [d for d in self.queue if d.kv_receiver is not None]
         if not live:
             return
 
-        # Still poll if any receiver was aborted, otherwise it stays stuck.
+        # 仍需轮询是否有接收器被中止，否则它会永远卡住。
         if all(d.waiting_for_input for d in live) and not any(
             d.kv_receiver.conclude_state == KVPoll.Failed for d in live
         ):
@@ -848,9 +845,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
 
-        # MLFQ: one queue, one policy. New requests (level 0) and demoted
-        # requests (level >= 1, service history preserved) compete together,
-        # ordered so the lowest level / least-served get memory first.
+        # MLFQ：一个队列、一个策略。新请求（level 0）与被降级的请求
+        # （level >= 1，服务历史保留）共同竞争，层级最低/受益最少的
+        # 先拿显存。
         if self.scheduler.server_args.schedule_policy == "mlfq":
             self.queue.sort(
                 key=lambda dr: (
@@ -902,9 +899,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            # Demoted request (MLFQ): its KV is already CPU-resident, so skip
-            # handshake/metadata/transfer entirely and just reclaim GPU memory.
-            # No receiver exists on this entry.
+            # 被降级的请求（MLFQ）：其 KV 已在 CPU 上，完全跳过
+            # 握手/metadata/传输，只需回收 GPU 显存。
+            # 该条目上没有接收器。
             if decode_req.kv_receiver is None:
                 full_required, _ = self._prealloc_required_tokens(decode_req.req)
                 if full_required > full_allocatable_tokens:
@@ -1132,8 +1129,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
-        # Demoted requests resumed inline above bypass the transfer queue
-        # (their KV came from CPU, not from prefill); admit them directly.
+        # 上面内联恢复的被降级请求绕过传输队列（其 KV 来自 CPU 而非
+        # prefill），直接准入。
         if resumed_reqs:
             self.scheduler.waiting_queue.extend(resumed_reqs)
 
@@ -1633,8 +1630,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
-        # P side piggybacks its prefill-finish wall-clock into the spare
-        # bootstrap_room slot 1 (see MetadataBuffers.set_buf).
+        # P 端把 prefill 完成的 wall-clock 搭载在 bootstrap_room 的
+        # 空闲槽位 1（见 MetadataBuffers.set_buf）。
         p_finish_ns = output_bootstrap_room[1].item()
         if p_finish_ns > 0:
             decode_req.req.time_stats.p_prefill_finished_walltime = (
@@ -1958,9 +1955,9 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     self.running_batch.merge_batch(new_prebuilt_batch)
 
-        # MLFQ rotation: demote a request that crossed a level boundary while
-        # others are queued for memory. Runs before update_running_batch (which
-        # prepares the decode tensors), so the batch stays consistent.
+        # MLFQ 轮换：当有人在排队等显存时，把跨过层级边界的请求降级。
+        # 在 update_running_batch（准备 decode 张量）之前执行，
+        # 保证 batch 状态一致。
         if self.server_args.schedule_policy == "mlfq":
             self._mlfq_rotate_running_batch()
 
@@ -1986,9 +1983,8 @@ class SchedulerDisaggregationDecodeMixin:
         if len(self.waiting_queue) == 0:
             return None
 
-        # MLFQ: admit lowest-level (least-served) requests first. Fresh
-        # requests whose prefill just finished are level 0 and enter ahead;
-        # demoted requests re-enter here with their service history.
+        # MLFQ：层级最低（受益最少）的请求先准入。prefill 刚完成的新请求
+        # 是 level 0 优先进入；被降级的请求带着服务历史在此重新进入。
         if self.server_args.schedule_policy == "mlfq":
             mlfq_sort_reqs(self.waiting_queue)
 
@@ -2064,9 +2060,8 @@ class SchedulerDisaggregationDecodeMixin:
             if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
                 # if there are still retracted requests, we do not allocate new requests
                 return
-        # MLFQ single-queue mode: demoted requests live in the prealloc queue
-        # itself and compete in pop_preallocated under the same policy as new
-        # arrivals, so there is no separate resume step here.
+        # MLFQ 单队列模式：被降级的请求就住在 prealloc 队列里，在
+        # pop_preallocated 中与新请求按同一策略竞争，这里没有单独的恢复步骤。
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0

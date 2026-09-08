@@ -566,15 +566,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     last_prefill_finished_time: float = 0.0
     run_batch_cpu_start_time: float = 0.0
 
-    # Accumulated GPU forward time in seconds across all decode rounds of
-    # this request. Recorded via CUDA events in tp_worker and read back after
-    # copy_done sync (true GPU compute time even under overlap scheduling).
-    # Updated sequentially on the single-threaded scheduler — no locking.
+    # 本请求所有 decode 轮次累计的 GPU 前向耗时（秒）。由 tp_worker 里的
+    # CUDA events 记录，copy_done 同步后读回（即使 overlap 调度下也是真实
+    # GPU 计算时长）。在单线程调度器上顺序更新，无需加锁。
     decode_gpu_total_time: float = 0.0
 
-    # Wall-clock seconds when the P side finished prefill, piggybacked through
-    # the transfer metadata buffer (bootstrap_room slot 1) and read on the D
-    # side at _commit_transfer_to_req. 0.0 until the transfer commits.
+    # P 端完成 prefill 的 wall-clock 秒，经传输 metadata buffer
+    # （bootstrap_room slot 1）搭载，D 端在 _commit_transfer_to_req 读取。
+    # 传输提交前保持 0.0。
     p_prefill_finished_walltime: float = 0.0
 
     # 请求到达 P 端（进入 bootstrap 队列）的 wall-clock 秒，经 metadata buffer
@@ -598,10 +597,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     prefill_retry_count: int = 0
 
     def __getstate__(self) -> object:
-        # Pickle projection sent over ZMQ to detokenizer/tokenizer.
-        # The three PD-disagg decode fields are always included so they reach
-        # client meta_info even when --enable-metrics is off. The remaining
-        # metrics-only fields keep the original gating to save bandwidth.
+        # 经 ZMQ 发给 detokenizer/tokenizer 的 pickle 投影。
+        # 三个 PD 分离 decode 字段始终包含，确保即使 --enable-metrics 关闭
+        # 也能到达客户端 meta_info；其余仅指标用的字段保持原来的门控以省带宽。
         state = {
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
@@ -1134,8 +1132,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def convert_to_output_meta_info(self):
         meta_data = {}
-        # D-side (PD-disagg) timestamps, converted from perf_counter to
-        # wall-clock for client readability.
+        # D 端（PD 分离）时间戳，从 perf_counter 转成 wall-clock
+        # 方便客户端阅读。
         if self.wait_queue_entry_time > 0.0:
             meta_data["d_received_from_p_ts"] = convert_time_to_realtime(
                 self.wait_queue_entry_time
@@ -1146,27 +1144,25 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             )
         if self.decode_gpu_total_time > 0.0:
             meta_data["decode_gpu_total_time"] = self.decode_gpu_total_time
-        # Already wall-clock (written by the P side), no conversion needed.
+        # 已是 wall-clock（P 端写入的），无需转换。
         if self.p_prefill_finished_walltime > 0.0:
             meta_data["p_prefill_finished_ts"] = self.p_prefill_finished_walltime
         if self.forward_entry_time > 0.0:
             meta_data["forward_entry_time"] = convert_time_to_realtime(
                 self.forward_entry_time
             )
-        # True D-side wait: from "P finished prefill" to "first scheduled into
-        # a decode batch". Covers prealloc wait + KV transfer + waiting-queue
-        # wait in one number. forward_entry_time is D-side perf_counter
-        # converted to wall-clock; p_prefill_finished_walltime is wall-clock
-        # from P — same machine, directly comparable.
+        # 真正的 D 端等待：从「P 完成 prefill」到「首次被调度进 decode batch」。
+        # 一个数字涵盖 prealloc 等待 + KV 传输 + waiting 队列等待。
+        # forward_entry_time 是 D 端 perf_counter 转成的 wall-clock；
+        # p_prefill_finished_walltime 是 P 端的 wall-clock——同机直接可比。
         if self.forward_entry_time > 0.0 and self.p_prefill_finished_walltime > 0.0:
             meta_data["d_true_wait_s"] = (
                 convert_time_to_realtime(self.forward_entry_time)
                 - self.p_prefill_finished_walltime
             )
-        # Final fairness metric: GPU compute time over total D-side dwell
-        # from "P finished prefill" to "request completion on D"
-        # (non-overlapping: prealloc wait + KV transfer + waiting-queue wait
-        # + decode residence, each segment counted exactly once).
+        # 最终公平性指标：GPU 计算时间 / D 端从「P 完成 prefill」到
+        # 「请求完成」的总驻留时长（各段不重叠：prealloc 等待 + KV 传输 +
+        # waiting 队列等待 + decode 驻留，每段只计一次）。
         if (
             self.decode_gpu_total_time > 0.0
             and self.completion_time > 0.0

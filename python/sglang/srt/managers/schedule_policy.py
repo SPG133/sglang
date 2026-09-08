@@ -144,9 +144,9 @@ class CacheAgnosticPolicy(Enum):
     LOF = "lof"  # longest output first
     RANDOM = "random"
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
-    # Accepted so that --schedule-policy mlfq validates. The MLFQ behavior
-    # itself lives on the disagg decode side (disaggregation/decode.py);
-    # the unified / prefill admission path keeps FCFS order.
+    # 仅为让 --schedule-policy mlfq 通过校验。MLFQ 的行为本身在
+    # 分离部署的 decode 端（disaggregation/decode.py）实现；
+    # 统一/预填充准入路径保持 FCFS 顺序。
     MLFQ = "mlfq"
 
 

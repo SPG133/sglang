@@ -84,15 +84,15 @@ class SchedulerBatchResultProcessor:
         result: "GenerationBatchResult",
         batch: Optional["ScheduleBatch"],
     ) -> None:
-        """Accumulate this round's GPU forward duration into each req.
+        """把本轮 GPU 前向耗时累加到 batch 内每个请求。
 
-        Must be called AFTER result.copy_done.synchronize(): at that point the
-        GPU side has already been synced, so reading elapsed_time costs nothing
-        extra and yields the true GPU compute time (not CPU launch overhead),
-        even under overlap scheduling and CUDA Graph replay.
+        必须在 result.copy_done.synchronize() 之后调用：那时 GPU 侧已
+        同步完成，读取 elapsed_time 没有额外开销，且得到的是真实 GPU
+        计算时长（不含 CPU 启动开销），即使 overlap 调度与 CUDA Graph
+        回放下也成立。
 
-        Runs on the single-threaded scheduler; each req belongs to exactly one
-        batch at a time, so the += accumulation needs no locking.
+        运行在单线程调度器上；每个请求同一时刻只属于一个 batch，
+        因此 += 累加无需加锁。
         """
         if (
             result.fpm_start_event is None

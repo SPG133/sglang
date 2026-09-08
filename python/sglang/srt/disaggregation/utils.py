@@ -361,9 +361,9 @@ class MetadataBuffers:
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
-        # Piggyback the prefill-finish wall-clock (ns) into a spare slot of the
-        # bootstrap_room buffer, so the decode side learns when P finished.
-        # perf_counter -> wall-clock conversion mirrors convert_time_to_realtime.
+        # 把 prefill 完成的 wall-clock（ns）搭载到 bootstrap_room 缓冲区的
+        # 空闲槽位，让 decode 端知道 P 何时完成。
+        # perf_counter → wall-clock 转换与 convert_time_to_realtime 一致。
         pf = req.time_stats.prefill_finished_time
         self.bootstrap_room[req.metadata_buffer_index, 1] = (
             int((pf + (time.time() - time.perf_counter())) * 1e9) if pf > 0 else 0

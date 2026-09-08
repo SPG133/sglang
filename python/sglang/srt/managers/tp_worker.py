@@ -469,12 +469,11 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch)
 
         if self.pp_group.is_last_rank:
-            # Bracket the model forward with CUDA events to capture the real
-            # GPU compute time. record() is async (just a stream marker), so
-            # this does not disturb overlap scheduling. The elapsed time is
-            # read later in batch_result_processor after copy_done sync.
-            # Only the last PP rank executes the full forward, so timing here
-            # avoids double-counting across pipeline stages.
+            # 用 CUDA events 夹住模型前向，捕获真实 GPU 计算时长。
+            # record() 是异步的（仅打流标记），不干扰 overlap 调度。
+            # 耗时稍后在 batch_result_processor 中 copy_done 同步后读取。
+            # 只有最后一个 PP rank 执行完整前向，在此计时可避免
+            # 跨流水线阶段重复计数。
             fpm_start_event = torch.cuda.Event(enable_timing=True)
             fpm_end_event = torch.cuda.Event(enable_timing=True)
             fpm_start_event.record()
