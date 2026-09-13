@@ -596,6 +596,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # Number of prefill retries for this request
     prefill_retry_count: int = 0
 
+    # 最近一次被 MLFQ 驱逐的时刻（perf_counter 域，供弹性晋升算等待时长）
+    last_demote_time: float = 0.0
+
     def __getstate__(self) -> object:
         # 经 ZMQ 发给 detokenizer/tokenizer 的 pickle 投影。
         # 三个 PD 分离 decode 字段始终包含，确保即使 --enable-metrics 关闭

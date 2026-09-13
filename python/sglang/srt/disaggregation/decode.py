@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -111,6 +112,71 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 # 校准（p50=312 轮、p80=1190 轮，约 26ms/轮）：
 # L0 = [0, 8.1s) 覆盖 50%，L1 = [8.1s, 31s) 覆盖 80%，L2 = [31s, +inf) 跑到完成。
 MLFQ_LEVEL_THRESHOLDS_S = (8.1, 31.0)
+
+# ===== 弹性阈值（防饥饿） =====
+# 全局跟踪已完成请求的慢化比（响应/纯GPU服务 = 1/life_fraction），滑动
+# 中位数为公平水位并随完成实时更新；L1/L2 里等待过久（等待/已获服务
+# 超水位）的请求晋升进 L0 队列。晋升只改排队位置：再次被踹回时仍按
+# 实际 GPU 服务时长归级。
+ELASTIC_HISTORY_SIZE = 256   # 慢化比滑动窗口大小
+ELASTIC_MIN_SAMPLES = 8      # 水位启用所需最少样本
+ELASTIC_CLIP = (2.0, 20.0)   # 水位钳制范围
+ELASTIC_MULTIPLIER = 1.0     # 水位系数（>1 晋升更晚，<1 更激进）
+
+
+class ElasticTracker:
+    """弹性阈值状态机：记录完成慢化比 → 计算全局水位 → 扫描晋升。"""
+
+    def __init__(self) -> None:
+        self.history: List[float] = []
+
+    def target(self) -> Optional[float]:
+        """全局水位：慢化比中位数 × 系数，钳制在 ELASTIC_CLIP。样本不足返回 None。"""
+        if len(self.history) < ELASTIC_MIN_SAMPLES:
+            return None
+        t = statistics.median(self.history) * ELASTIC_MULTIPLIER
+        return min(max(t, ELASTIC_CLIP[0]), ELASTIC_CLIP[1])
+
+    def record(self, req: "Req") -> None:
+        """记录完成请求的慢化比 =（到达D → 完成)/ 纯GPU服务。"""
+        ts = req.time_stats
+        if ts.completion_time > 0 and ts.decode_prealloc_queue_entry_time > 0:
+            resp = ts.completion_time - ts.decode_prealloc_queue_entry_time
+            if resp > 0 and ts.decode_gpu_total_time > 0:
+                self.history.append(resp / ts.decode_gpu_total_time)
+                del self.history[: len(self.history) - ELASTIC_HISTORY_SIZE]
+
+    def boost(self, prealloc: "DecodePreallocQueue") -> int:
+        """把 L1/L2 里 等待/服务 超水级的被踹回请求移入 L0 队尾参与
+        最高优先级准入。晋升只改排队位置：再次被踹回时仍按实际 GPU
+        服务时长归级（add() 的归级不读 mlfq_boosted）。返回晋升数。"""
+        t = self.target()
+        if t is None:
+            return 0
+        now = time.perf_counter()
+        n = 0
+        for level in (1, 2):
+            remain = []
+            for d in getattr(prealloc, f"mlfq_l{level}"):
+                ts = d.req.time_stats
+                if (
+                    not d.mlfq_boosted
+                    and ts.last_demote_time > 0
+                    and (now - ts.last_demote_time)
+                    / max(ts.decode_gpu_total_time, 1e-3)
+                    > t
+                ):
+                    d.mlfq_boosted = True
+                    prealloc.mlfq_l0.append(d)
+                    n += 1
+                    logger.info(
+                        f"MLFQ elastic boost: {d.req.rid} L{level}->L0 "
+                        f"(target {t:.1f})"
+                    )
+                else:
+                    remain.append(d)
+            setattr(prealloc, f"mlfq_l{level}", remain)
+        return n
 
 
 def mlfq_level(req: "Req") -> int:
@@ -288,6 +354,8 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    # 弹性晋升标记：已被搬进 L0 队列（重踹时按实际服务归级，标记随旧条目销毁）
+    mlfq_boosted: bool = False
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -351,10 +419,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_rank = pp_rank
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
-        # Queue for requests pending pre-allocation
-        self.queue: List[DecodeRequest] = []
+        # MLFQ 物理分级队列：L0=新请求（含弹性晋升者），L1/L2=按实际
+        # GPU 服务时长被踹回的请求。严格优先级准入：L0 非空只放 L0，
+        # 空了才依次放 L1、L2；每级内部 FCFS（插入序）。
+        # FCFS 模式下所有请求都进 L0，行为与原单队列完全一致。
+        self.mlfq_l0: List[DecodeRequest] = []
+        self.mlfq_l1: List[DecodeRequest] = []
+        self.mlfq_l2: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
+        # 弹性阈值状态（慢化比窗口 + 晋升扫描，见 ElasticTracker）
+        self.elastic = ElasticTracker()
         self._ensure_retry_count: Dict[str, int] = {}
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
@@ -498,6 +573,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
         return kv_manager
 
+    @staticmethod
+    def _mlfq_tier(d: "DecodeRequest") -> int:
+        """归级规则：新请求/弹性晋升者 → L0；被踹回者按实际层级。"""
+        if d.kv_receiver is not None or d.mlfq_boosted:
+            return 0
+        return mlfq_level(d.req)
+
+    @property
+    def queue(self) -> List[DecodeRequest]:
+        """扁平视图（L0→L1→L2，级内 FCFS）。顺序无关的既有代码（握手
+        轮询、失败扫描、准入扫描、等待者计数）继续用它；入队请走
+        mlfq_l0/ l1 / l2 或 add()。"""
+        return self.mlfq_l0 + self.mlfq_l1 + self.mlfq_l2
+
+    @queue.setter
+    def queue(self, items: List["DecodeRequest"]) -> None:
+        """整体重建（准入/中止后的过滤赋值）：按归级规则重新分层。"""
+        self.mlfq_l0 = [d for d in items if self._mlfq_tier(d) == 0]
+        self.mlfq_l1 = [d for d in items if self._mlfq_tier(d) == 1]
+        self.mlfq_l2 = [d for d in items if self._mlfq_tier(d) == 2]
+
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
         if self._check_if_req_exceed_kv_capacity(req):
@@ -506,13 +602,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if is_retracted:
             req.retraction_mb_id = None
             if self.scheduler.server_args.schedule_policy == "mlfq":
-                # MLFQ 降级：被驱逐的请求回到 prealloc 队列，与新请求在
-                # 同一策略下竞争。驱逐时其 KV 已换出到 CPU（req.kv_cache_cpu），
-                # 准入时直接载回，无需从 prefill 重新传输。kv_receiver 在首次
-                # 传输后已销毁，故为 None；waiting_for_input=True 使其跳过握手轮询。
-                self.queue.append(
-                    DecodeRequest(req=req, kv_receiver=None, waiting_for_input=True)
-                )
+                # 被踹回：按实际 GPU 服务时长归入 L1/L2（KV 已落 CPU，
+                # kv_receiver=None 免握手/传输）；记降级时刻供弹性晋升。
+                # 晋升只改变排队位置，不影响归级依据（decode_gpu_total_time）。
+                req.time_stats.last_demote_time = time.perf_counter()
+                d = DecodeRequest(req=req, kv_receiver=None, waiting_for_input=True)
+                (self.mlfq_l1 if mlfq_level(req) <= 1 else self.mlfq_l2).append(d)
             else:
                 self.retracted_queue.append(req)
         else:
@@ -583,7 +678,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         decode_req = DecodeRequest(req=req, kv_receiver=kv_receiver)
-        self.queue.append(decode_req)
+        self.mlfq_l0.append(decode_req)  # 新请求一律进 L0
         return decode_req
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
@@ -843,19 +938,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             priority_sign = (
                 1 if self.scheduler.schedule_low_priority_values_first else -1
             )
-            self.queue.sort(key=lambda r: r.req.priority * priority_sign)
+            # FCFS 模式下所有条目都在 L0，直接对 L0 排序
+            self.mlfq_l0.sort(key=lambda r: r.req.priority * priority_sign)
 
-        # MLFQ：一个队列、一个策略。新请求（level 0）与被降级的请求
-        # （level >= 1，服务历史保留）共同竞争，层级最低/受益最少的
-        # 先拿显存。
+        # MLFQ 分级准入：不做排序——扁平视图天然按 L0→L1→L2 排列且级内
+        # FCFS，下方顺序扫描即"有 L0 只放 L0，预算有余才依次动 L1、L2"。
+        # 先做弹性晋升：等待/服务超水位的被踹回请求移入 L0 队尾。
         if self.scheduler.server_args.schedule_policy == "mlfq":
-            self.queue.sort(
-                key=lambda dr: (
-                    mlfq_level(dr.req),
-                    dr.req.time_stats.decode_gpu_total_time,
-                    dr.req.time_stats.wait_queue_entry_time,
-                )
-            )
+            self.elastic.boost(self)
 
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
@@ -1894,6 +1984,10 @@ class SchedulerDisaggregationDecodeMixin:
         （L1→L2），之后不再打断直到完成（L2 没有下一级边界）。
         """
         running = self.running_batch.reqs
+        # 顺手采集弹性阈值统计：完成请求在 filter 前仍留在 running 里
+        for r in running:
+            if r.finished():
+                self.disagg_decode_prealloc_queue.elastic.record(r)
         # 只统计真正在等显存的条目：握手完成的（waiting_for_input=True，
         # 含被踢回来等恢复的，add() 时已设 True）。排除还在握手中的
         # 新请求——它们拿到显存也暂时用不上，踢人给它们让位是空转。
