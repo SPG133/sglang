@@ -430,6 +430,9 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
+    # MLFQ 弹性阈值开关：仅在 --schedule-policy mlfq 下生效，
+    # 用完成请求慢化比的自适应水位防止被降级请求饥饿
+    enable_elastic_threshold: bool = False
     enable_priority_scheduling: bool = False
     disable_priority_preemption: bool = False
     default_priority_value: Optional[int] = None
@@ -4849,6 +4852,14 @@ class ServerArgs:
                 "mlfq",
             ],
             help="The scheduling policy of the requests.",
+        )
+        parser.add_argument(
+            "--enable-elastic-threshold",
+            action="store_true",
+            default=ServerArgs.enable_elastic_threshold,
+            help="开启 MLFQ 弹性阈值（防饥饿）：仅 --schedule-policy mlfq 下生效。"
+            "以完成请求慢化比的滑动中位数为自适应水位，"
+            "被降级请求等待/服务超水位即晋升回 L0。",
         )
         parser.add_argument(
             "--enable-priority-scheduling",

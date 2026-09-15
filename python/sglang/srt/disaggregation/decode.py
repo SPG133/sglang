@@ -581,6 +581,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return mlfq_level(d.req)
 
     @property
+    def enable_elastic(self) -> bool:
+        """弹性阈值总开关：--schedule-policy mlfq 且 --enable-elastic-threshold。"""
+        return (
+            self.scheduler.server_args.schedule_policy == "mlfq"
+            and self.scheduler.server_args.enable_elastic_threshold
+        )
+
+    @property
     def queue(self) -> List[DecodeRequest]:
         """扁平视图（L0→L1→L2，级内 FCFS）。顺序无关的既有代码（握手
         轮询、失败扫描、准入扫描、等待者计数）继续用它；入队请走
@@ -603,9 +611,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.retraction_mb_id = None
             if self.scheduler.server_args.schedule_policy == "mlfq":
                 # 被踹回：按实际 GPU 服务时长归入 L1/L2（KV 已落 CPU，
-                # kv_receiver=None 免握手/传输）；记降级时刻供弹性晋升。
-                # 晋升只改变排队位置，不影响归级依据（decode_gpu_total_time）。
-                req.time_stats.last_demote_time = time.perf_counter()
+                # kv_receiver=None 免握手/传输）。弹性阈值开启时记降级
+                # 时刻，供晋升计算等待时长；晋升只改排队位置，不影响
+                # 归级依据（decode_gpu_total_time）。
+                if self.enable_elastic:
+                    req.time_stats.last_demote_time = time.perf_counter()
                 d = DecodeRequest(req=req, kv_receiver=None, waiting_for_input=True)
                 (self.mlfq_l1 if mlfq_level(req) <= 1 else self.mlfq_l2).append(d)
             else:
@@ -943,8 +953,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # MLFQ 分级准入：不做排序——扁平视图天然按 L0→L1→L2 排列且级内
         # FCFS，下方顺序扫描即"有 L0 只放 L0，预算有余才依次动 L1、L2"。
-        # 先做弹性晋升：等待/服务超水位的被踹回请求移入 L0 队尾。
-        if self.scheduler.server_args.schedule_policy == "mlfq":
+        # 弹性晋升（需 --enable-elastic-threshold）：超水位的被踹回请求移入 L0 队尾。
+        if self.enable_elastic:
             self.elastic.boost(self)
 
         # First, remove all failed requests from the queue
@@ -1984,10 +1994,11 @@ class SchedulerDisaggregationDecodeMixin:
         （L1→L2），之后不再打断直到完成（L2 没有下一级边界）。
         """
         running = self.running_batch.reqs
-        # 顺手采集弹性阈值统计：完成请求在 filter 前仍留在 running 里
-        for r in running:
-            if r.finished():
-                self.disagg_decode_prealloc_queue.elastic.record(r)
+        # 弹性阈值进账（开关开启时）：完成请求在 filter 前仍留在 running 里
+        if self.disagg_decode_prealloc_queue.enable_elastic:
+            for r in running:
+                if r.finished():
+                    self.disagg_decode_prealloc_queue.elastic.record(r)
         # 只统计真正在等显存的条目：握手完成的（waiting_for_input=True，
         # 含被踢回来等恢复的，add() 时已设 True）。排除还在握手中的
         # 新请求——它们拿到显存也暂时用不上，踢人给它们让位是空转。

@@ -29,14 +29,28 @@ import argparse
 import json
 import math
 import random
-import urllib.request
 from pathlib import Path
 
-# vLLM/SGLang 生态默认使用的 ShareGPT 镜像地址
-DEFAULT_SHAREGPT_URL = (
-    "https://huggingface.co/datasets/anon941485/sharegpt_90k_dataset"
-    "/resolve/main/sharegpt_90k_dataset.json"
-)
+# ShareGPT 原始数据源（Vicuna v1.5 用的 V4.3 清洗版，~6.9 万段真实 ChatGPT 对话）。
+# hf_hub_download 自动遵循 HF_ENDPOINT（国内: export HF_ENDPOINT=https://hf-mirror.com），
+# 下载一次后进 HF 缓存，之后离线可用。
+SHAREGPT_REPO = "Aeala/ShareGPT_Vicuna_unfiltered"
+SHAREGPT_FILE = "ShareGPT_V4.3_unfiltered_cleaned_split.json"
+
+
+def acquire_sharegpt(local: str = None) -> str:
+    """返回 ShareGPT 原始 JSON 的本地路径：优先 --sharegpt 指定文件或
+    当前目录同名文件，否则从 HuggingFace 下载进缓存。"""
+    if local and Path(local).exists():
+        return local
+    if Path(SHAREGPT_FILE).exists():
+        return SHAREGPT_FILE
+    from huggingface_hub import hf_hub_download
+
+    print(f"下载 ShareGPT：{SHAREGPT_REPO}/{SHAREGPT_FILE}（442MB，一次性）")
+    return hf_hub_download(
+        repo_id=SHAREGPT_REPO, filename=SHAREGPT_FILE, repo_type="dataset"
+    )
 
 
 def iter_sharegpt(path: str):
@@ -81,16 +95,8 @@ def main():
     p.add_argument("--output", default="sharegpt_workload.json")
     a = p.parse_args()
 
-    # 1. 拿到 ShareGPT 原始文件
-    sg_path = a.sharegpt
-    if sg_path is None or not Path(sg_path).exists():
-        sg_path = "sharegpt_90k_dataset.json"
-        if not Path(sg_path).exists():
-            print(f"本地无 ShareGPT 文件，尝试下载:\n  {DEFAULT_SHAREGPT_URL}")
-            print("（国内网络建议先: export HF_ENDPOINT=https://hf-mirror.com，"
-                  "或手动下载后用 --sharegpt 指定路径）")
-            urllib.request.urlretrieve(DEFAULT_SHAREGPT_URL, sg_path)
-            print(f"已下载: {sg_path}")
+    # 1. 拿到 ShareGPT 原始文件（本地指定 > 当前目录 > 自动下载）
+    sg_path = acquire_sharegpt(a.sharegpt)
 
     # 2. tokenizer（chat template 必须和线上一致）
     from transformers import AutoTokenizer

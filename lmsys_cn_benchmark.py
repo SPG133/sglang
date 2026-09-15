@@ -4,8 +4,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
-from datasets import load_dataset
 from transformers import AutoTokenizer
+
+from make_sharegpt_workload import acquire_sharegpt, iter_sharegpt
 
 
 def iso():
@@ -19,18 +20,14 @@ def load_workload(a):
         print(f"复用固定 workload：{path}")
         return data[: a.num_requests]
 
+    # 兜底生成：数据源 = ShareGPT（本地无原始文件时自动下载，见
+    # make_sharegpt_workload.acquire_sharegpt）。--request-rate 只在此刻
+    # 生效，生成后 send_offset_s 烤进文件，运行时严格按文件发送。
+    sg_path = acquire_sharegpt()
     tok = AutoTokenizer.from_pretrained(a.tokenizer, trust_remote_code=True)
-    ds = load_dataset("lmsys/lmsys-chat-1m", split="train", streaming=True)
-    ds = ds.shuffle(seed=a.seed, buffer_size=10_000)
     rng, data, arrival = random.Random(a.seed), [], 0.0
 
-    for row in ds:
-        if str(row.get("language", "")).lower() != "chinese":
-            continue
-        conv = row.get("conversation", [])
-        if len(conv) < 2:
-            continue
-        prompt, reference = conv[0].get("content", ""), conv[1].get("content", "")
+    for prompt, reference in iter_sharegpt(sg_path):
         if not prompt or not reference:
             continue
         chat = tok.apply_chat_template(

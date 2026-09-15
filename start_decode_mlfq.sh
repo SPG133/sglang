@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# FCFS 基线的 decode 端启动脚本（对照组）
-# MLFQ 版见 start_decode_mlfq.sh，弹性阈值版见 start_decode_emlfq.sh
+# 纯分级 MLFQ 的 decode 端启动脚本
+# 三级反馈队列（L0/L1/L2 严格优先级准入 + 8.1s/31s 服务计量驱逐），无弹性阈值
 MODEL="$PWD/models/Qwen3-8B"
 
 CUDA_VISIBLE_DEVICES=1 python -m sglang.launch_server \
@@ -8,4 +8,5 @@ CUDA_VISIBLE_DEVICES=1 python -m sglang.launch_server \
   --port 30001 \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend nixl \
+  --schedule-policy mlfq \
   --disable-radix-cache
