@@ -111,16 +111,19 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 # 层级边界（按已获 GPU 服务秒数），由 lmsys-cn 负载的 decode 轮次分布
 # 校准（p50=312 轮、p80=1190 轮，约 26ms/轮）：
 # L0 = [0, 8.1s) 覆盖 50%，L1 = [8.1s, 31s) 覆盖 80%，L2 = [31s, +inf) 跑到完成。
-MLFQ_LEVEL_THRESHOLDS_S = (8.1, 31.0)
+MLFQ_LEVEL_THRESHOLDS_S = (50, 80)
 
-# ===== 弹性阈值（防饥饿） =====
-# 全局跟踪已完成请求的慢化比（响应/纯GPU服务 = 1/life_fraction），滑动
-# 中位数为公平水位并随完成实时更新；L1/L2 里等待过久（等待/已获服务
-# 超水位）的请求晋升进 L0 队列。晋升只改排队位置：再次被踹回时仍按
-# 实际 GPU 服务时长归级。
-ELASTIC_HISTORY_SIZE = 256   # 慢化比滑动窗口大小
-ELASTIC_MIN_SAMPLES = 8      # 水位启用所需最少样本
-ELASTIC_CLIP = (2.0, 20.0)   # 水位钳制范围
+# ===== 防饥饿晋升 =====
+# 默认（--schedule-policy mlfq 即生效）：经典 MLFQ aging——被踹回的请求
+# 等待超过 ELASTIC_PROMOTE_AFTER_S 秒即晋升回 L0 队尾。
+# --enable-elastic-threshold：判定升级为弹性水位（等待/已获服务 超
+# 慢化比滑动中位数水位，随完成实时更新，负载自适应）。
+# 两种判定下晋升都只改排队位置：再次被踹回时仍按实际 GPU 服务时长归级。
+ELASTIC_PROMOTE_AFTER_S = 50.0     # 默认 aging 的固定阈值（秒），想调改这里
+
+ELASTIC_HISTORY_SIZE = 256   # 慢化比滑动窗口大小（弹性水位用）
+ELASTIC_MIN_SAMPLES = 8      # 水位启用所需最少样本（弹性水位用）
+ELASTIC_CLIP = (2.0, 20.0)   # 水位钳制范围（弹性水位用）
 ELASTIC_MULTIPLIER = 1.0     # 水位系数（>1 晋升更晚，<1 更激进）
 
 
@@ -147,25 +150,31 @@ class ElasticTracker:
                 del self.history[: len(self.history) - ELASTIC_HISTORY_SIZE]
 
     def boost(self, prealloc: "DecodePreallocQueue") -> int:
-        """把 L1/L2 里 等待/服务 超水级的被踹回请求移入 L0 队尾参与
-        最高优先级准入。晋升只改排队位置：再次被踹回时仍按实际 GPU
-        服务时长归级（add() 的归级不读 mlfq_boosted）。返回晋升数。"""
-        t = self.target()
-        if t is None:
-            return 0
+        """把 L1/L2 里超过晋升判定的被踹回请求移入 L0 队尾参与最高优先级
+        准入。判定分两档：默认（无弹性开关）比 等待秒数 > ELASTIC_PROMOTE_AFTER_S
+        （经典 MLFQ aging）；--enable-elastic-threshold 时比 等待/已获服务 >
+        全局水位（自适应）。晋升只改排队位置：重踹仍按实际服务归级。返回晋升数。"""
+        if prealloc.enable_elastic:
+            t = self.target()
+            if t is None:
+                return 0
+            use_ratio = True
+        else:
+            t = ELASTIC_PROMOTE_AFTER_S
+            use_ratio = False
         now = time.perf_counter()
         n = 0
         for level in (1, 2):
             remain = []
             for d in getattr(prealloc, f"mlfq_l{level}"):
                 ts = d.req.time_stats
-                if (
-                    not d.mlfq_boosted
-                    and ts.last_demote_time > 0
-                    and (now - ts.last_demote_time)
-                    / max(ts.decode_gpu_total_time, 1e-3)
-                    > t
-                ):
+                wait = now - ts.last_demote_time
+                overdue = (
+                    wait / max(ts.decode_gpu_total_time, 1e-3) > t
+                    if use_ratio
+                    else wait > t
+                )
+                if not d.mlfq_boosted and ts.last_demote_time > 0 and overdue:
                     d.mlfq_boosted = True
                     prealloc.mlfq_l0.append(d)
                     n += 1
@@ -953,8 +962,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # MLFQ 分级准入：不做排序——扁平视图天然按 L0→L1→L2 排列且级内
         # FCFS，下方顺序扫描即"有 L0 只放 L0，预算有余才依次动 L1、L2"。
-        # 弹性晋升（需 --enable-elastic-threshold）：超水位的被踹回请求移入 L0 队尾。
-        if self.enable_elastic:
+        # 防饥饿晋升：默认固定阈值 aging；--enable-elastic-threshold 时
+        # 判定升级为弹性水位（见 ElasticTracker.boost）。
+        if self.scheduler.server_args.schedule_policy == "mlfq":
             self.elastic.boost(self)
 
         # First, remove all failed requests from the queue
