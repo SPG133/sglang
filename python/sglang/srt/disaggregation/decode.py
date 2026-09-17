@@ -141,7 +141,14 @@ class ElasticTracker:
         return min(max(t, ELASTIC_CLIP[0]), ELASTIC_CLIP[1])
 
     def record(self, req: "Req") -> None:
-        """记录完成请求的慢化比 =（到达D → 完成)/ 纯GPU服务。"""
+        """记录被驱逐请求的慢化比 =（到达D → 完成)/ 纯GPU服务。
+
+        只统计 retraction_count > 0 的请求：从没被踹过的干净请求慢化比≈1
+        （life_fraction≈100%），把它们算进来会把水位拖到 1 附近，让"等多久
+        算不公平"的参考线失真。公平水位必须由"受害群体"定义。
+        """
+        if req.retraction_count == 0:
+            return
         ts = req.time_stats
         if ts.completion_time > 0 and ts.decode_prealloc_queue_entry_time > 0:
             resp = ts.completion_time - ts.decode_prealloc_queue_entry_time
